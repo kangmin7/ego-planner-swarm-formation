@@ -35,9 +35,9 @@ from quadrotor_msgs.msg import PositionCommand
 
 from px4_bridge.frame_transforms import enu_to_ned_position, enu_to_ned_velocity, enu_yaw_to_ned_yaw
 
-HEARTBEAT_TICKS = 15      # 1.5 s of OffboardControlMode before arm + offboard, matches mission_executor
-RETRY_TICKS = 20          # resend arm + offboard every 2 s until PX4 confirms ARMED
-TICK_HZ = 10.0
+HEARTBEAT_TICKS = 30      # 1.5 s of OffboardControlMode before arm + offboard, matches mission_executor
+RETRY_TICKS = 40          # resend arm + offboard every 2 s until PX4 confirms ARMED
+TICK_HZ = 20.0            # higher rate keeps the per-tick position-setpoint step small as max_vel grows
 
 TAKEOFF_ALT_M = 1.5       # climb-in-place target altitude before handing off to the planner
 TAKEOFF_TOLERANCE_M = 0.3

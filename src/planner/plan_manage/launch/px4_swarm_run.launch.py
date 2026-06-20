@@ -36,9 +36,9 @@ def generate_launch_description():
     # loops; widening both (2.0 / 1.5) let those resolve into a normal
     # REPLAN_TRAJ/EXEC_TRAJ cycle instead of getting stuck.
     drone_configs = [
-        {'drone_id': 0, 'spawn_y': -8.0, 'target_y': -8.0, 'target_z': 1.0},
-        {'drone_id': 1, 'spawn_y': 0.0, 'target_y': 0.0, 'target_z': 1.8},
-        {'drone_id': 2, 'spawn_y': 8.0, 'target_y': 8.0, 'target_z': 2.6},
+        {'drone_id': 0, 'spawn_y': -14.0, 'target_y': -14.0, 'target_z': 2.0},
+        {'drone_id': 1, 'spawn_y': 0.0, 'target_y': 0.0, 'target_z': 2.0},
+        {'drone_id': 2, 'spawn_y': 14.0, 'target_y': 14.0, 'target_z': 2.0},
     ]
 
     ld = LaunchDescription()
@@ -67,6 +67,9 @@ def generate_launch_description():
                 'target_z': str(cfg['target_z']),
                 'emergency_time': str(2.0),
                 'swarm_clearance': str(1.5),
+                'max_vel': str(5.0),
+                'max_acc': str(5.0),
+                'virtual_ceil_height': str(4.3),
             }.items()
         )
         ld.add_action(drone_launch)

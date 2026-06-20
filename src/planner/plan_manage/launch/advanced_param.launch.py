@@ -159,7 +159,17 @@ def generate_launch_description():
             {'grid_map/local_update_range_z': 4.5},
             {'grid_map/obstacles_inflation': 0.35},
             {'grid_map/local_map_margin': 10},
-            {'grid_map/ground_height': -0.01},
+            # -0.01 (effectively no floor) was inherited from the point-mass
+            # so3_quadrotor_simulator setup, where z=0 had no physical
+            # consequence. With real PX4+Gazebo dynamics this let the
+            # optimizer's search consider near-ground paths that sit in the
+            # lidar's vertical-scan blind spot near a pillar's base (16/64
+            # rings leave gaps there), producing a path that reads as clear
+            # but is actually ground/pillar-base -- real contact, drone stuck
+            # at z~0.1-0.4m with ground_contact=true. Raising the floor well
+            # above actual ground removes that whole search region instead of
+            # trying to patch the optimizer's choices after the fact.
+            {'grid_map/ground_height': 0.5},
             # camera parameter
             {'grid_map/cx': cx},
             {'grid_map/cy': cy},

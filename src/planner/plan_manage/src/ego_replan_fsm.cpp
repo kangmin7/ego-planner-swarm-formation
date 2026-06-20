@@ -312,7 +312,11 @@ namespace ego_planner
     // RCLCPP_INFO(node_->get_logger(), "Clock type: %d", rclcpp::Clock().now().get_clock_type());
     // RCLCPP_INFO(node_->get_logger(), "Start time clock type: %d", rclcpp::Time(msg->start_time).get_clock_type());
     // RCLCPP_INFO(node_->get_logger(), "msg_time: %d", msg_time.get_clock_type());
-    if (abs((rclcpp::Clock().now() - msg_time).seconds()) > 0.25)
+    // 0.25s was tight enough that ordinary executor backlog under 3 simultaneous
+    // PX4/Gazebo processes could trip it on its own, dropping the update and
+    // leaving swarm_trajs_buf_ stale -- which is itself what let a stale buffer
+    // get evaluated past its duration_ (see checkCollisionCallback's guard).
+    if (abs((rclcpp::Clock().now() - msg_time).seconds()) > 1.0)
     {
       // ROS_ERROR("Time difference is too large! Local - Remote Agent %d = %fs", msg->drone_id, (ros::Time::now() - msg->start_time).toSec());
       RCLCPP_ERROR(node_->get_logger(), "Time difference is too large! Local - Remote Agent %d = %fs",
@@ -699,8 +703,8 @@ namespace ego_planner
         // whole time. After giving GEN_NEW_TRAJ a couple seconds to find its
         // own way out, retreat to the most recent position in our trail that
         // the map shows as clear, and try again from there.
-        // exec_timer_ ticks every 10ms, so the threshold below is ~3s of being
-        // stuck. No velocity gate here (unlike the GEN_NEW_TRAJ escape branch
+        // This runs on safety_timer_ (50ms period), so the threshold below
+        // is ~15s of being stuck. No velocity gate here (unlike the GEN_NEW_TRAJ escape branch
         // below): a drone physically wedged against a pillar can show
         // persistent >0.3 m/s contact jitter that never settles, which made
         // retreat never fire at all (observed stuck for 70+s). The retreat
@@ -895,6 +899,18 @@ namespace ego_planner
         }
 
         double t_X = t_cur_global - planner_manager_->swarm_trajs_buf_.at(id).start_time_.seconds();
+        // A stale buffer (e.g. one whose BroadcastBsplineCallback updates kept
+        // getting rejected for clock skew) holds a start_time_ that falls
+        // further behind real time the longer it goes un-refreshed. Evaluating
+        // such a trajectory at t_X past its duration_ extrapolates the spline
+        // into territory with no real meaning -- that bogus predicted position
+        // can spuriously land near our own path, latching a false "occupied"
+        // that no replan can ever resolve (the real, distant drone was never
+        // actually there). Treat a stale/expired buffer as irrelevant instead.
+        if (t_X < 0.0 || t_X > planner_manager_->swarm_trajs_buf_.at(id).duration_)
+        {
+          continue;
+        }
         Eigen::Vector3d swarm_pridicted = planner_manager_->swarm_trajs_buf_.at(id).position_traj_.evaluateDeBoorT(t_X);
         double dist = (p_cur - swarm_pridicted).norm();
 
