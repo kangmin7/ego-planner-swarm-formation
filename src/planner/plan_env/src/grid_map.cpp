@@ -177,7 +177,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
       std::bind(&GridMap::updateOccupancyCallback, this));
 
   vis_timer_ = node_->create_wall_timer(
-      std::chrono::duration<double>(0.11),
+      std::chrono::duration<double>(0.5),
       std::bind(&GridMap::visCallback, this));
 
   // 发布者

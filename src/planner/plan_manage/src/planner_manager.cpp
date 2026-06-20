@@ -40,7 +40,16 @@ namespace ego_planner
     bspline_optimizer_->setParam(node);
     bspline_optimizer_->setEnvironment(grid_map_, obj_predictor_);
     bspline_optimizer_->a_star_.reset(new AStar);
-    bspline_optimizer_->a_star_->initGridMap(grid_map_, Eigen::Vector3i(100, 100, 100));
+    // Must cover the full local sensing range: at the default
+    // grid_map/resolution=0.1 and local_update_range_(x,y)=5.5/local_update_range_z=4.5,
+    // that's a 110x110x90-cell diameter centered on the drone. The previous
+    // (100,100,100) pool was undersized for x/y, so any A* start/end point in
+    // the outer ~0.5 m band of the sensed area (a real, legitimately-sensed
+    // location, not a bug in the caller) produced "Coord2Index: Ran out of
+    // pool" / "Unable to handle the initial or end point" -- which in turn
+    // made rebound_optimize refuse to plan, contributing to drones getting
+    // stuck unable to escape near obstacles.
+    bspline_optimizer_->a_star_->initGridMap(grid_map_, Eigen::Vector3i(120, 120, 100));
 
     visualization_ = vis;
   }

@@ -14,6 +14,7 @@ def generate_launch_description():
     camera_pose_topic = LaunchConfiguration('camera_pose_topic', default='camera_pose')
     depth_topic = LaunchConfiguration('depth_topic', default='depth_image')
     cloud_topic = LaunchConfiguration('cloud_topic', default='cloud')
+    use_depth_filter = LaunchConfiguration('use_depth_filter', default=True)
     
     cx = LaunchConfiguration('cx', default=321.04638671875)
     cy = LaunchConfiguration('cy', default=243.44969177246094)
@@ -23,6 +24,11 @@ def generate_launch_description():
     max_vel = LaunchConfiguration('max_vel', default=2.0)
     max_acc = LaunchConfiguration('max_acc', default=3.0)
     planning_horizon = LaunchConfiguration('planning_horizon', default=7.5)
+
+    emergency_time = LaunchConfiguration('emergency_time', default=1.0)
+    swarm_clearance = LaunchConfiguration('swarm_clearance', default=0.5)
+    virtual_ceil_height = LaunchConfiguration('virtual_ceil_height', default=2.9)
+    min_takeoff_height = LaunchConfiguration('min_takeoff_height', default=-1.0)
     
     point_num = LaunchConfiguration('point_num', default=1)
     point0_x = LaunchConfiguration('point0_x', default=0.0)
@@ -56,6 +62,7 @@ def generate_launch_description():
     camera_pose_topic_arg = DeclareLaunchArgument('camera_pose_topic', default_value=camera_pose_topic, description='Camera pose topic')
     depth_topic_arg = DeclareLaunchArgument('depth_topic', default_value=depth_topic, description='Depth topic')
     cloud_topic_arg = DeclareLaunchArgument('cloud_topic', default_value=cloud_topic, description='Point cloud topic')
+    use_depth_filter_arg = DeclareLaunchArgument('use_depth_filter', default_value=use_depth_filter, description='Use depth-image fusion (true) or independent point-cloud input (false)')
     cx_arg = DeclareLaunchArgument('cx', default_value=cx, description='Camera intrinsic cx')
     cy_arg = DeclareLaunchArgument('cy', default_value=cy, description='Camera intrinsic cy')
     fx_arg = DeclareLaunchArgument('fx', default_value=fx, description='Camera intrinsic fx')
@@ -63,6 +70,10 @@ def generate_launch_description():
     max_vel_arg = DeclareLaunchArgument('max_vel', default_value=max_vel, description='Maximum velocity')
     max_acc_arg = DeclareLaunchArgument('max_acc', default_value=max_acc, description='Maximum acceleration')
     planning_horizon_arg = DeclareLaunchArgument('planning_horizon', default_value=planning_horizon, description='Planning horizon')
+    emergency_time_arg = DeclareLaunchArgument('emergency_time', default_value=emergency_time, description='Emergency stop time window')
+    swarm_clearance_arg = DeclareLaunchArgument('swarm_clearance', default_value=swarm_clearance, description='Min inter-drone clearance')
+    virtual_ceil_height_arg = DeclareLaunchArgument('virtual_ceil_height', default_value=virtual_ceil_height, description='Virtual ceiling height')
+    min_takeoff_height_arg = DeclareLaunchArgument('min_takeoff_height', default_value=min_takeoff_height, description='Min real altitude (odom z) before the planner starts its first trajectory; -1 disables the gate')
     
     point_num_arg = DeclareLaunchArgument('point_num', default_value=point_num, description='Number of waypoints')
     point0_x_arg = DeclareLaunchArgument('point0_x', default_value=point0_x, description='Waypoint 0 X coordinate')
@@ -117,10 +128,11 @@ def generate_launch_description():
             {'fsm/thresh_no_replan_meter': 1.0},
             {'fsm/planning_horizon': planning_horizon},
             {'fsm/planning_horizen_time': 3.0},
-            {'fsm/emergency_time': 1.0},
+            {'fsm/emergency_time': emergency_time},
             {'fsm/realworld_experiment': False},
             {'fsm/fail_safe': True},
-            
+            {'fsm/min_takeoff_height': min_takeoff_height},
+
             {'fsm/waypoint_num': point_num},
             {'fsm/waypoint0_x': point0_x},
             {'fsm/waypoint0_y': point0_y},
@@ -145,7 +157,7 @@ def generate_launch_description():
             {'grid_map/local_update_range_x': 5.5},
             {'grid_map/local_update_range_y': 5.5},
             {'grid_map/local_update_range_z': 4.5},
-            {'grid_map/obstacles_inflation': 0.099},
+            {'grid_map/obstacles_inflation': 0.35},
             {'grid_map/local_map_margin': 10},
             {'grid_map/ground_height': -0.01},
             # camera parameter
@@ -154,7 +166,7 @@ def generate_launch_description():
             {'grid_map/fx': fx},
             {'grid_map/fy': fy},
             # depth filter
-            {'grid_map/use_depth_filter': True},
+            {'grid_map/use_depth_filter': use_depth_filter},
             {'grid_map/depth_filter_tolerance': 0.15},
             {'grid_map/depth_filter_maxdist': 5.0},
             {'grid_map/depth_filter_mindist': 0.2},
@@ -170,7 +182,7 @@ def generate_launch_description():
             {'grid_map/min_ray_length': 0.1},
             {'grid_map/max_ray_length': 4.5},
             
-            {'grid_map/virtual_ceil_height': 2.9},
+            {'grid_map/virtual_ceil_height': virtual_ceil_height},
             {'grid_map/visualization_truncate_height': 1.8},
             {'grid_map/show_occ_time': False},
             {'grid_map/pose_type': 1},
@@ -190,7 +202,7 @@ def generate_launch_description():
             {'optimization/lambda_feasibility': 0.1},
             {'optimization/lambda_fitness': 1.0},
             {'optimization/dist0': 0.5},
-            {'optimization/swarm_clearance': 0.5},
+            {'optimization/swarm_clearance': swarm_clearance},
             {'optimization/max_vel': max_vel},
             {'optimization/max_acc': max_acc},
 
@@ -217,6 +229,7 @@ def generate_launch_description():
     ld.add_action(camera_pose_topic_arg)
     ld.add_action(depth_topic_arg)
     ld.add_action(cloud_topic_arg)
+    ld.add_action(use_depth_filter_arg)
     ld.add_action(cx_arg)
     ld.add_action(cy_arg)
     ld.add_action(fx_arg)
@@ -224,7 +237,11 @@ def generate_launch_description():
     ld.add_action(max_vel_arg)
     ld.add_action(max_acc_arg)
     ld.add_action(planning_horizon_arg)
-    
+    ld.add_action(emergency_time_arg)
+    ld.add_action(swarm_clearance_arg)
+    ld.add_action(virtual_ceil_height_arg)
+    ld.add_action(min_takeoff_height_arg)
+
     ld.add_action(point_num_arg)
     ld.add_action(point0_x_arg)
     ld.add_action(point0_y_arg)

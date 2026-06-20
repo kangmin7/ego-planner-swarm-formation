@@ -22,6 +22,17 @@ namespace ego_planner
     node_->declare_parameter("fsm/emergency_time", 1.0);
     node_->declare_parameter("fsm/realworld_experiment", false);
     node_->declare_parameter("fsm/fail_safe", true);
+    // PX4 path: odom/target/trigger are all available almost immediately at
+    // node startup, well before the drone has physically left the ground
+    // (arming + offboard_bridge's in-place climb to its takeoff altitude
+    // takes several real seconds). Without this gate, planFromGlobalTraj's
+    // first call -- and thus the trajectory's internal time origin -- fires
+    // while the drone is still grounded; each subsequent replan then chains
+    // from where the *previous plan* said the drone should be by now, not
+    // from the actually-stationary real position, so the internal trajectory
+    // races ahead and can reach WAIT_TARGET while the real, bridge-held drone
+    // never moved. Default -1 (disabled) preserves existing non-PX4 launches.
+    node_->declare_parameter("fsm/min_takeoff_height", -1.0);
 
     node_->get_parameter("fsm/flight_type", target_type_);
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
@@ -31,6 +42,7 @@ namespace ego_planner
     node_->get_parameter("fsm/emergency_time", emergency_time_);
     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
+    node_->get_parameter("fsm/min_takeoff_height", min_takeoff_height_);
 
     have_trigger_ = !flag_realworld_experiment_;
 
@@ -142,7 +154,8 @@ namespace ego_planner
 
       RCLCPP_WARN(node_->get_logger(), "Waiting for trigger from [n3ctrl] from RC");
 
-      while (rclcpp::ok() && (!have_odom_ || !have_trigger_))
+      while (rclcpp::ok() && (!have_odom_ || !have_trigger_ ||
+                              (min_takeoff_height_ > 0.0 && odom_pos_(2) < min_takeoff_height_)))
       {
         rclcpp::spin_some(node_);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -264,6 +277,27 @@ namespace ego_planner
     odom_orient_.z() = msg->pose.pose.orientation.z;
 
     have_odom_ = true;
+
+    double t_now = rclcpp::Clock().now().seconds();
+    // Freeze the trail while stuck in EMERGENCY_STOP: held nearly stationary
+    // there, every new sample is a near-duplicate of the last, and letting
+    // the window's time cutoff age out the genuinely pre-stuck history (from
+    // before the drone got wedged) just because the emergency dragged on
+    // leaves retreat with nothing useful to aim for, no matter how long the
+    // window is.
+    if (exec_state_ != EMERGENCY_STOP &&
+        (pos_history_.empty() || t_now - pos_history_.back().first > 0.1))
+    {
+      pos_history_.emplace_back(t_now, odom_pos_);
+      // 3.0s used to be the window here, but at the ~0.5 m/s typical speed
+      // near dense obstacles that's only ~1.5m of trail -- nowhere near
+      // enough to back out of a deep pocket between tightly packed pillars
+      // (observed: every point in a 3s trail still read as occupied, so
+      // retreat had nothing genuinely clear to aim for). 12s gives a much
+      // longer effective leash back toward open space.
+      while (!pos_history_.empty() && t_now - pos_history_.front().first > 12.0)
+        pos_history_.pop_front();
+    }
   }
 
   void EGOReplanFSM::BroadcastBsplineCallback(const std::shared_ptr<const traj_utils::msg::Bspline> &msg)
@@ -493,6 +527,8 @@ namespace ego_planner
     {
       if (!have_target_ || !have_trigger_)
         goto force_return;
+      if (min_takeoff_height_ > 0.0 && odom_pos_(2) < min_takeoff_height_)
+        goto force_return;
       else
       {
         changeFSMExecState(SEQUENTIAL_START, "FSM");
@@ -537,6 +573,14 @@ namespace ego_planner
         changeFSMExecState(EXEC_TRAJ, "FSM");
         flag_escape_emergency_ = true;
         publishSwarmTrajs(false);
+        replan_fail_ticks_ = 0;
+        retreat_attempt_count_ = 0;
+      }
+      else if (++replan_fail_ticks_ > 100) // see REPLAN_TRAJ's comment on this cap
+      {
+        callEmergencyStop(odom_pos_);
+        changeFSMExecState(EMERGENCY_STOP, "FSM");
+        replan_fail_ticks_ = 0;
       }
       else
       {
@@ -552,10 +596,31 @@ namespace ego_planner
       {
         changeFSMExecState(EXEC_TRAJ, "FSM");
         publishSwarmTrajs(false);
+        replan_fail_ticks_ = 0;
+        retreat_attempt_count_ = 0;
       }
       else
       {
-        changeFSMExecState(REPLAN_TRAJ, "FSM");
+        // planFromCurrentTraj can fail forever (e.g. the current position is
+        // itself inside an obstacle's inflated zone, so every candidate start
+        // is rejected) with no cap -- observed running 30000+ failed attempts
+        // in under two minutes while real PX4 setpoints stayed frozen on the
+        // last successful trajectory, and the drone's real position diverged
+        // far from where the planner thought it was. exec_timer_ ticks every
+        // 10ms, so 100 ticks here is ~1s -- in line with emergency_time_'s
+        // role elsewhere as the "how long can we keep retrying before we must
+        // stop" budget. Escalate to EMERGENCY_STOP (and its retreat logic)
+        // instead of spinning here indefinitely.
+        if (++replan_fail_ticks_ > 100)
+        {
+          callEmergencyStop(odom_pos_);
+          changeFSMExecState(EMERGENCY_STOP, "FSM");
+          replan_fail_ticks_ = 0;
+        }
+        else
+        {
+          changeFSMExecState(REPLAN_TRAJ, "FSM");
+        }
       }
 
       break;
@@ -566,8 +631,15 @@ namespace ego_planner
       /* determine if need to replan */
       LocalTrajData *info = &planner_manager_->local_data_;
       rclcpp::Time time_now = rclcpp::Clock().now();
-      double t_cur = (time_now - info->start_time_).seconds();
-      t_cur = std::min(info->duration_, t_cur);
+      // t_elapsed is the real (unclamped) wall-clock time since this trajectory
+      // started -- used below to decide *when* to replan. A trajectory whose
+      // local target got pulled back near the start (e.g. the obstacle-fallback
+      // in getLocalTarget()) can have duration_ well under replan_thresh_; if the
+      // replan-timing checks used the clamped t_cur instead, t_cur would be stuck
+      // at that tiny duration_ forever and never exceed replan_thresh_, so
+      // REPLAN_TRAJ would never re-trigger and the FSM would freeze in EXEC_TRAJ.
+      double t_elapsed = (time_now - info->start_time_).seconds();
+      double t_cur = std::min(info->duration_, t_elapsed);
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
 
@@ -595,12 +667,12 @@ namespace ego_planner
           changeFSMExecState(WAIT_TARGET, "FSM");
           goto force_return;
         }
-        else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
+        else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_elapsed > replan_thresh_)
         {
           changeFSMExecState(REPLAN_TRAJ, "FSM");
         }
       }
-      else if (t_cur > replan_thresh_)
+      else if (t_elapsed > replan_thresh_)
       {
         changeFSMExecState(REPLAN_TRAJ, "FSM");
       }
@@ -614,11 +686,93 @@ namespace ego_planner
       if (flag_escape_emergency_) // Avoiding repeated calls
       {
         callEmergencyStop(odom_pos_);
+        stuck_in_emergency_ticks_ = 0;
+        retreat_attempt_count_ = 0; // fresh emergency stop, not a continued retreat
       }
       else
       {
-        if (enable_fail_safe_ && odom_vel_.norm() < 0.1)
+        // If the point we braked at is itself inside an obstacle's inflated
+        // zone, GEN_NEW_TRAJ will keep failing forever (rebound_optimize
+        // correctly refuses to plan from an occupied start) and we'd just
+        // keep holding here -- which, since this point is inside an
+        // obstacle, means physically sitting on top of / touching it the
+        // whole time. After giving GEN_NEW_TRAJ a couple seconds to find its
+        // own way out, retreat to the most recent position in our trail that
+        // the map shows as clear, and try again from there.
+        // exec_timer_ ticks every 10ms, so the threshold below is ~3s of being
+        // stuck. No velocity gate here (unlike the GEN_NEW_TRAJ escape branch
+        // below): a drone physically wedged against a pillar can show
+        // persistent >0.3 m/s contact jitter that never settles, which made
+        // retreat never fire at all (observed stuck for 70+s). The retreat
+        // step itself is a tiny, occupancy-checked nudge, so it's safe
+        // regardless of current velocity.
+        bool stuck_in_obstacle = planner_manager_->grid_map_->getInflateOccupancy(odom_pos_);
+        if (stuck_in_obstacle)
+          stuck_in_emergency_ticks_++;
+        else
+          stuck_in_emergency_ticks_ = 0;
+
+        if (stuck_in_obstacle && stuck_in_emergency_ticks_ > 300)
+        {
+          Eigen::Vector3d target_pos;
+          bool found_target = false;
+          for (auto &entry : pos_history_)
+          {
+            if (!planner_manager_->grid_map_->getInflateOccupancy(entry.second))
+            {
+              target_pos = entry.second;
+              found_target = true;
+              break;
+            }
+          }
+
+          // No point in the flown trail was clear -- the drone is wedged
+          // deep enough that "backward in time" isn't a direction that
+          // leads out. Search omnidirectionally from here instead (observed
+          // necessary: 25+ retreat attempts along history alone, capped at
+          // the max 2.0m step, never escaped).
+          if (!found_target)
+            found_target = findNearbyClearPoint(odom_pos_, 3.0, target_pos);
+
+          // Last resort if even that fails (e.g. truly boxed in within 3m):
+          // fall back to the oldest trail point, same as before this fix.
+          if (!found_target && !pos_history_.empty())
+          {
+            target_pos = pos_history_.front().second;
+            found_target = true;
+          }
+
+          if (!found_target)
+            goto force_return;
+
+          // Don't teleport: the historical free point can be meters away,
+          // and a real PX4 position controller can't cleanly track a
+          // multi-meter discontinuous setpoint jump -- repeatedly trying to
+          // is itself destabilizing (observed causing a crash). Step a
+          // bounded distance toward the known-clear point instead, so each
+          // correction is a gentle nudge the controller can follow, and
+          // re-check from the new point on the next stuck cycle.
+          // The step must clear grid_map/obstacles_inflation (0.35m) or it
+          // can land still inside the inflated zone it just left -- a fixed
+          // 0.3m step never escaped for exactly this reason. Escalate on
+          // repeated failures (deep pockets between tightly packed pillars
+          // can need several steps' worth of distance), capped well short of
+          // the destabilizing multi-meter jump above.
+          retreat_attempt_count_++;
+          double step_m = std::min(0.5 * retreat_attempt_count_, 2.0);
+          Eigen::Vector3d dir = target_pos - odom_pos_;
+          double dist = dir.norm();
+          Eigen::Vector3d retreat_pos = (dist > step_m) ? Eigen::Vector3d(odom_pos_ + dir / dist * step_m) : target_pos;
+
+          RCLCPP_WARN(node_->get_logger(), "Stuck in obstacle during emergency stop, retreating (attempt %d, step %.2fm).",
+                      retreat_attempt_count_, step_m);
+          callEmergencyStop(retreat_pos);
+          stuck_in_emergency_ticks_ = 0;
+        }
+        else if (enable_fail_safe_ && odom_vel_.norm() < 0.1)
+        {
           changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        }
       }
 
       flag_escape_emergency_ = false;
@@ -884,6 +1038,45 @@ namespace ego_planner
     broadcast_bspline_pub_->publish(bspline);
   }
 
+  bool EGOReplanFSM::findNearbyClearPoint(const Eigen::Vector3d &from, double max_radius_m, Eigen::Vector3d &out)
+  {
+    // Retreating along the flown trail only works if some point on that
+    // trail is genuinely clear. Observed: a drone that got wedged deep
+    // enough into a pocket between tightly packed pillars can have its
+    // *entire* recorded trail (even 12s of it) still read as occupied --
+    // there's nowhere "back" to go. In that case the only way out is to
+    // search omnidirectionally from the current position for the nearest
+    // clear cell, not just backward in time.
+    static const std::vector<Eigen::Vector3d> kDirections = []
+    {
+      std::vector<Eigen::Vector3d> dirs;
+      for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dz = -1; dz <= 1; ++dz)
+          {
+            if (dx == 0 && dy == 0 && dz == 0)
+              continue;
+            dirs.emplace_back(Eigen::Vector3d(dx, dy, dz).normalized());
+          }
+      return dirs;
+    }();
+
+    for (double r = 0.3; r <= max_radius_m; r += 0.3)
+    {
+      for (const auto &dir : kDirections)
+      {
+        Eigen::Vector3d candidate = from + dir * r;
+        if (planner_manager_->grid_map_->isInMap(candidate) &&
+            !planner_manager_->grid_map_->getInflateOccupancy(candidate))
+        {
+          out = candidate;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   bool EGOReplanFSM::callEmergencyStop(Eigen::Vector3d stop_pos)
   {
 
@@ -965,6 +1158,72 @@ namespace ego_planner
     {
       local_target_pt_ = end_pt_;
       planner_manager_->global_data_.last_progress_time_ = planner_manager_->global_data_.global_duration_;
+    }
+
+    // getLocalTarget() just samples the naive straight-line global reference at
+    // planning_horizen_ distance -- it has no idea where obstacles are. In dense
+    // clutter that point can itself land inside an inflated obstacle (e.g. a pillar
+    // that wasn't known yet when the global reference was generated), which leaves
+    // check_collision_and_rebound() with no free terminal point to fall back to and
+    // the FSM stuck retrying the same impossible target forever.
+    //
+    // Searching backward along the start->target line only (the original fix here)
+    // is too restrictive: if several pillars' inflated zones straddle that exact
+    // line at different distances, every backward step can still be occupied, and
+    // the search collapses to a point right next to start_pt_ -- handing the
+    // optimizer a near-zero-length, still-tightly-wedged terminal point it can
+    // never rebound out of (observed as an endless "collided, keep optimizing"
+    // loop with no actual progress). Instead, search outward in full 3D for the
+    // nearest free cell to the naive target; this lets the local target move
+    // *sideways* into a gap between obstacles, giving the kinodynamic rebound
+    // optimizer room to actually route around the cluster instead of just
+    // retreating along a blocked line.
+    //
+    // Keep the vertical search range tight (a couple of resolution steps, not
+    // a full meter): a sparse-vertical-channel lidar (e.g. 16 beams over the
+    // map's flight envelope) leaves narrow z-slices between scan rings
+    // "unobserved" rather than occupied even where a tall obstacle (a pillar
+    // spanning the whole envelope, say) truly fills that space. A wide dz
+    // search exploits those sensor gaps as if they were real openings,
+    // sending the drone to "free" cells that are actually still inside the
+    // obstacle -- observed as a sustained vertical bobbing oscillation with
+    // no forward progress once the gap was (mis)found. Restricting dz keeps
+    // this a genuinely lateral (xy) gap search, which is where real openings
+    // between obstacles actually are.
+    if (planner_manager_->grid_map_->getInflateOccupancy(local_target_pt_))
+    {
+      const double resolution = planner_manager_->grid_map_->getResolution();
+      const double max_search_radius = planning_horizen_;
+      const double max_dz = 2 * resolution;
+      Eigen::Vector3d best_pt = local_target_pt_;
+      double best_dist_to_start = -1.0;
+      bool found = false;
+      for (double radius = resolution; radius <= max_search_radius && !found; radius += resolution)
+      {
+        int n_steps = std::max(8, static_cast<int>(std::ceil(2 * M_PI * radius / resolution)));
+        for (int i = 0; i < n_steps; ++i)
+        {
+          double theta = 2 * M_PI * i / n_steps;
+          for (double dz = -max_dz; dz <= max_dz + 1e-3; dz += resolution)
+          {
+            Eigen::Vector3d candidate = local_target_pt_ + Eigen::Vector3d(radius * cos(theta), radius * sin(theta), dz);
+            if (!planner_manager_->grid_map_->getInflateOccupancy(candidate))
+            {
+              found = true;
+              double dist_to_start = (candidate - start_pt_).norm();
+              // among free cells found at this radius, prefer the one that makes
+              // the most forward progress (farthest from start_pt_), so the local
+              // target still pulls the drone onward rather than sideways-only.
+              if (dist_to_start > best_dist_to_start)
+              {
+                best_dist_to_start = dist_to_start;
+                best_pt = candidate;
+              }
+            }
+          }
+        }
+      }
+      local_target_pt_ = best_pt;
     }
 
     if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))

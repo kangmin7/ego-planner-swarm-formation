@@ -3,6 +3,7 @@
 
 #include <Eigen/Eigen>
 #include <algorithm>
+#include <deque>
 #include <iostream>
 #include "nav_msgs/msg/path.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -63,6 +64,7 @@ namespace ego_planner
     double emergency_time_;
     bool flag_realworld_experiment_;
     bool enable_fail_safe_;
+    double min_takeoff_height_;
 
     /* planning data */
     bool have_trigger_, have_target_, have_odom_, have_new_target_, have_recv_pre_agent_;
@@ -71,6 +73,17 @@ namespace ego_planner
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
     Eigen::Quaterniond odom_orient_;
+
+    // Recent (timestamp, position) trail, used by callEmergencyStop to retreat
+    // to a known-recently-free point when the drone brakes on top of / inside
+    // an obstacle's inflated zone (real PX4 dynamics + sensing/reaction lag can
+    // overshoot the safe stopping margin in dense fields) -- holding in place
+    // there is otherwise a permanent deadlock: rebound_optimize correctly
+    // refuses to replan from a start point inside an obstacle.
+    std::deque<std::pair<double, Eigen::Vector3d>> pos_history_;
+    int stuck_in_emergency_ticks_{0};
+    int replan_fail_ticks_{0};
+    int retreat_attempt_count_{0};
 
     Eigen::Vector3d init_pt_, start_pt_, start_vel_, start_acc_, start_yaw_; // start state
     Eigen::Vector3d end_pt_, end_vel_;                                       // goal state
@@ -102,6 +115,7 @@ namespace ego_planner
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromGlobalTraj(const int trial_times = 1);
     bool planFromCurrentTraj(const int trial_times = 1);
+    bool findNearbyClearPoint(const Eigen::Vector3d &from, double max_radius_m, Eigen::Vector3d &out);
 
     /* return value: std::pair< Times of the same state be continuously called, current continuously called state > */
     void changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call);
