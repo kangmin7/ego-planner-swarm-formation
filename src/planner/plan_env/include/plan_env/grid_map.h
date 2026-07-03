@@ -83,6 +83,7 @@ struct MappingParameters
 
   /* visualization and computation time display */
   double visualization_truncate_height_, virtual_ceil_height_, ground_height_, virtual_ceil_yp_, virtual_ceil_yn_;
+  double virtual_floor_height_;
   bool show_occ_time_;
 
   /* active mapping */
@@ -114,6 +115,7 @@ struct MappingData
   bool occ_need_update_, local_updated_;
   bool has_first_depth_;
   bool has_odom_, has_cloud_;
+  bool has_processed_cloud_;
 
   // odom_depth_timeout_
   rclcpp::Time last_occ_update_time_;
@@ -188,12 +190,18 @@ public:
   void publishDepth();
 
   bool hasDepthObservation();
+  bool hasCloudObservation();
   bool odomValid();
   void getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size);
   inline double getResolution();
   Eigen::Vector3d getOrigin();
   int getVoxelNum();
   bool getOdomDepthTimeout() { return md_.flag_depth_odom_timeout_; }
+  // Enabled iff > map origin z (mirrors the fill condition in the two
+  // occupancy-update paths); callers needing a safe altitude floor should
+  // treat values <= origin z as "no floor".
+  double getVirtualFloorHeight() { return mp_.virtual_floor_height_; }
+  double getOriginZ() { return mp_.map_origin_(2); }
 
   typedef std::shared_ptr<GridMap> Ptr;
 
@@ -358,6 +366,17 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
 {
   if (!isInMap(pos))
     return -1;
+
+  // Geometric virtual floor/ceiling: the per-scan voxel fill only covers each
+  // scan's local bound box, so trajectory segments beyond current scan
+  // coverage saw unknown (= free) space near the ground and the optimizer
+  // dove into the lidar's near-ground blind band (a follower was commanded
+  // to z=0.8 and flown into the ground). Enforcing the bounds here makes
+  // them hold everywhere, independent of scan coverage.
+  if (mp_.virtual_floor_height_ > mp_.map_origin_(2) && pos(2) < mp_.virtual_floor_height_)
+    return 1;
+  if (mp_.virtual_ceil_height_ > -0.5 && pos(2) > mp_.virtual_ceil_height_)
+    return 1;
 
   Eigen::Vector3i id;
   posToIndex(pos, id);

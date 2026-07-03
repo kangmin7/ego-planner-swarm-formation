@@ -27,7 +27,11 @@ def generate_launch_description():
 
     emergency_time = LaunchConfiguration('emergency_time', default=1.0)
     swarm_clearance = LaunchConfiguration('swarm_clearance', default=0.5)
+    formation_type = LaunchConfiguration('formation_type', default=0)
+    lambda_formation = LaunchConfiguration('lambda_formation', default=0.0)
+    formation_num = LaunchConfiguration('formation_num', default=0)
     virtual_ceil_height = LaunchConfiguration('virtual_ceil_height', default=2.9)
+    virtual_floor_height = LaunchConfiguration('virtual_floor_height', default=-1000.0)
     min_takeoff_height = LaunchConfiguration('min_takeoff_height', default=-1.0)
     
     point_num = LaunchConfiguration('point_num', default=1)
@@ -72,7 +76,11 @@ def generate_launch_description():
     planning_horizon_arg = DeclareLaunchArgument('planning_horizon', default_value=planning_horizon, description='Planning horizon')
     emergency_time_arg = DeclareLaunchArgument('emergency_time', default_value=emergency_time, description='Emergency stop time window')
     swarm_clearance_arg = DeclareLaunchArgument('swarm_clearance', default_value=swarm_clearance, description='Min inter-drone clearance')
+    formation_type_arg = DeclareLaunchArgument('formation_type', default_value=formation_type, description='Desired formation shape (0=none, 1=hexagon(7), 2=triangle(3))')
+    lambda_formation_arg = DeclareLaunchArgument('lambda_formation', default_value=lambda_formation, description='Formation similarity cost weight')
+    formation_num_arg = DeclareLaunchArgument('formation_num', default_value=formation_num, description='Formation member count for the takeoff barrier (0 disables)')
     virtual_ceil_height_arg = DeclareLaunchArgument('virtual_ceil_height', default_value=virtual_ceil_height, description='Virtual ceiling height')
+    virtual_floor_height_arg = DeclareLaunchArgument('virtual_floor_height', default_value=virtual_floor_height, description='Mark map cells below this z occupied (default disabled)')
     min_takeoff_height_arg = DeclareLaunchArgument('min_takeoff_height', default_value=min_takeoff_height, description='Min real altitude (odom z) before the planner starts its first trajectory; -1 disables the gate')
     
     point_num_arg = DeclareLaunchArgument('point_num', default_value=point_num, description='Number of waypoints')
@@ -154,9 +162,14 @@ def generate_launch_description():
             {'grid_map/map_size_x': map_size_x},
             {'grid_map/map_size_y': map_size_y},
             {'grid_map/map_size_z': map_size_z},
-            {'grid_map/local_update_range_x': 5.5},
-            {'grid_map/local_update_range_y': 5.5},
-            {'grid_map/local_update_range_z': 4.5},
+            # cloudCallback's resetBuffer() re-zeros this entire window every single
+            # point-cloud message (grid_map.cpp:826) -- at 0.1m resolution the original
+            # 5.5/5.5/4.5 box was >1M voxels per call, per drone. Trimmed to keep a
+            # still-generous several-meter sensing margin while cutting that
+            # reset+raycast+inflate cost roughly in half.
+            {'grid_map/local_update_range_x': 4.5},
+            {'grid_map/local_update_range_y': 4.5},
+            {'grid_map/local_update_range_z': 3.5},
             {'grid_map/obstacles_inflation': 0.35},
             {'grid_map/local_map_margin': 10},
             # -0.01 (effectively no floor) was inherited from the point-mass
@@ -193,6 +206,7 @@ def generate_launch_description():
             {'grid_map/max_ray_length': 4.5},
             
             {'grid_map/virtual_ceil_height': virtual_ceil_height},
+            {'grid_map/virtual_floor_height': virtual_floor_height},
             {'grid_map/visualization_truncate_height': 1.8},
             {'grid_map/show_occ_time': False},
             {'grid_map/pose_type': 1},
@@ -215,6 +229,9 @@ def generate_launch_description():
             {'optimization/swarm_clearance': swarm_clearance},
             {'optimization/max_vel': max_vel},
             {'optimization/max_acc': max_acc},
+            {'optimization/formation_type': formation_type},
+            {'optimization/lambda_formation': lambda_formation},
+            {'fsm/formation_num': formation_num},
 
             # B-Spline parameters
             {'bspline/limit_vel': max_vel},
@@ -249,7 +266,11 @@ def generate_launch_description():
     ld.add_action(planning_horizon_arg)
     ld.add_action(emergency_time_arg)
     ld.add_action(swarm_clearance_arg)
+    ld.add_action(formation_type_arg)
+    ld.add_action(lambda_formation_arg)
+    ld.add_action(formation_num_arg)
     ld.add_action(virtual_ceil_height_arg)
+    ld.add_action(virtual_floor_height_arg)
     ld.add_action(min_takeoff_height_arg)
 
     ld.add_action(point_num_arg)

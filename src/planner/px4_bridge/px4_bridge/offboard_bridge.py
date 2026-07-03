@@ -39,8 +39,23 @@ HEARTBEAT_TICKS = 30      # 1.5 s of OffboardControlMode before arm + offboard, 
 RETRY_TICKS = 40          # resend arm + offboard every 2 s until PX4 confirms ARMED
 TICK_HZ = 20.0            # higher rate keeps the per-tick position-setpoint step small as max_vel grows
 
-TAKEOFF_ALT_M = 1.5       # climb-in-place target altitude before handing off to the planner
+# Hold 0.5 m ABOVE the 2.0 m cruise altitude: the handoff to the planner's
+# first trajectory pitches the vehicle over hard, and the resulting altitude
+# dip (~0.5-0.7 m observed) must not reach the near-ground lidar blind band /
+# pillar-base region. Handing off at cruise altitude exactly (1.5, with the
+# virtual floor at 1.0) left no margin and lost a drone to a ground-level
+# pillar strike right after departure.
+TAKEOFF_ALT_M = 2.5       # climb-in-place target altitude before handing off to the planner
 TAKEOFF_TOLERANCE_M = 0.3
+
+# Don't arm until the EKF height estimate has been quiet on the ground for
+# this long (ticks at TICK_HZ). Arming the instant preflight passes -- on a
+# barely-converged EKF -- produced two distinct wrecks: a runaway climb to
+# 22 m (controller chasing a drifting height reference; PX4 had logged
+# "height estimate not stable" / "vertical velocity unstable" moments
+# earlier) and a takeoff that flew itself into the ground while its estimate
+# read 2.2 m.
+EKF_SETTLE_TICKS = 60     # 3 s of |vz| < 0.15 and |z| < 0.5 while grounded
 
 # A distance gate used to live here ("only hand off once the live setpoint is
 # near the drone"), added after liftoff produced a real impact with a pillar.
@@ -81,6 +96,19 @@ class OffboardBridge(Node):
         self.declare_parameter('target_system', 1)
         self._target_system = self.get_parameter('target_system').value
 
+        # Counterpart of odom_cloud_bridge's spawn_offset_enu: the planner
+        # commands positions in the shared world frame, PX4 expects them in
+        # its own spawn-origin local frame, so subtract the spawn position
+        # (world ENU) before the ENU->NED conversion. Keep both parameters
+        # identical for a given drone.
+        self.declare_parameter('spawn_x', 0.0)
+        self.declare_parameter('spawn_y', 0.0)
+        self._spawn_offset_enu = (
+            self.get_parameter('spawn_x').value,
+            self.get_parameter('spawn_y').value,
+            0.0,
+        )
+
         px4_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -111,6 +139,7 @@ class OffboardBridge(Node):
         self._state = State.GROUNDED
         self._takeoff_xy_yaw = (0.0, 0.0, float('nan'))
         self._hb_count = 0
+        self._ekf_settle_ticks = 0
 
         self.create_timer(1.0 / TICK_HZ, self._tick)
         self.get_logger().info('px4_offboard_bridge ready — waiting for /position_cmd')
@@ -130,7 +159,9 @@ class OffboardBridge(Node):
             self._hb_count = 0
 
     def _cb_position_cmd(self, msg: PositionCommand):
-        self._setpoint_ned = enu_to_ned_position(msg.position.x, msg.position.y, msg.position.z)
+        self._setpoint_ned = enu_to_ned_position(msg.position.x - self._spawn_offset_enu[0],
+                                                 msg.position.y - self._spawn_offset_enu[1],
+                                                 msg.position.z - self._spawn_offset_enu[2])
         self._velocity_ned = enu_to_ned_velocity(msg.velocity.x, msg.velocity.y, msg.velocity.z)
         self._yaw_ned = enu_yaw_to_ned_yaw(msg.yaw)
         self._have_position_cmd = True
@@ -190,6 +221,17 @@ class OffboardBridge(Node):
             self.get_logger().info(f'armed -> climbing in place to {TAKEOFF_ALT_M} m')
             self._state = State.TAKEOFF
             return
+
+        # EKF settle gate (see EKF_SETTLE_TICKS above): hold off arming until
+        # the height estimate is demonstrably stable on the ground.
+        if abs(self._local_pos.vz) < 0.15 and abs(self._local_pos.z) < 0.5:
+            self._ekf_settle_ticks += 1
+        else:
+            self._ekf_settle_ticks = 0
+        if self._ekf_settle_ticks < EKF_SETTLE_TICKS:
+            return
+        if self._ekf_settle_ticks == EKF_SETTLE_TICKS:
+            self.get_logger().info('EKF height stable -> proceeding to arm')
 
         self._hb_count += 1
         if self._hb_count >= HEARTBEAT_TICKS and self._hb_count % RETRY_TICKS == 0:

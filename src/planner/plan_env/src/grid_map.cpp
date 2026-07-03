@@ -37,6 +37,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/max_ray_length", -0.1);
   node_->declare_parameter("grid_map/visualization_truncate_height", -0.1);
   node_->declare_parameter("grid_map/virtual_ceil_height", -0.1);
+  node_->declare_parameter("grid_map/virtual_floor_height", -1000.0);
   node_->declare_parameter("grid_map/virtual_ceil_yp", -0.1);
   node_->declare_parameter("grid_map/virtual_ceil_yn", -0.1);
   node_->declare_parameter("grid_map/show_occ_time", false);
@@ -74,6 +75,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/max_ray_length", mp_.max_ray_length_);
   node_->get_parameter("grid_map/visualization_truncate_height", mp_.visualization_truncate_height_);
   node_->get_parameter("grid_map/virtual_ceil_height", mp_.virtual_ceil_height_);
+  node_->get_parameter("grid_map/virtual_floor_height", mp_.virtual_floor_height_);
   node_->get_parameter("grid_map/virtual_ceil_yp", mp_.virtual_ceil_yp_);
   node_->get_parameter("grid_map/virtual_ceil_yn", mp_.virtual_ceil_yn_);
   node_->get_parameter("grid_map/show_occ_time", mp_.show_occ_time_);
@@ -135,33 +137,42 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
 
   /* init callback */
 
-  // 初始化 message_filters::Subscriber
-  depth_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-      node_, "grid_map/depth", rclcpp::QoS(50).get_rmw_qos_profile());
-
-  extrinsic_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
-      "/vins_estimator/extrinsic", 10,
-      std::bind(&GridMap::extrinsicCallback, this, std::placeholders::_1));
-
-  if (mp_.pose_type_ == POSE_STAMPED)
+  // The depth-image/pose-or-odom synchronized path (and the unrelated VINS
+  // extrinsic subscription it's bundled with) is only needed when
+  // use_depth_filter_ is true. The PX4 lidar/point-cloud path
+  // (use_depth_filter_=false) never publishes on any of these topics, so
+  // creating them anyway just adds idle DDS subscriptions/discovery
+  // overhead per drone for a path that's never exercised.
+  if (mp_.use_depth_filter_)
   {
-    pose_sub_ = std::make_shared<message_filters::Subscriber<geometry_msgs::msg::PoseStamped>>(
-        node_, "grid_map/pose", rclcpp::QoS(25).get_rmw_qos_profile());
+    // 初始化 message_filters::Subscriber
+    depth_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+        node_, "grid_map/depth", rclcpp::QoS(50).get_rmw_qos_profile());
 
-    sync_image_pose_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImagePose>>(
-        SyncPolicyImagePose(100), *depth_sub_, *pose_sub_);
-    sync_image_pose_->registerCallback(
-        std::bind(&GridMap::depthPoseCallback, this, std::placeholders::_1, std::placeholders::_2));
-  }
-  else if (mp_.pose_type_ == ODOMETRY)
-  {
-    odom_sub_ = std::make_shared<message_filters::Subscriber<nav_msgs::msg::Odometry>>(
-        node_, "grid_map/odom", rclcpp::QoS(100).get_rmw_qos_profile());
+    extrinsic_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+        "/vins_estimator/extrinsic", 10,
+        std::bind(&GridMap::extrinsicCallback, this, std::placeholders::_1));
 
-    sync_image_odom_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImageOdom>>(
-        SyncPolicyImageOdom(100), *depth_sub_, *odom_sub_);
-    sync_image_odom_->registerCallback(
-        std::bind(&GridMap::depthOdomCallback, this, std::placeholders::_1, std::placeholders::_2));
+    if (mp_.pose_type_ == POSE_STAMPED)
+    {
+      pose_sub_ = std::make_shared<message_filters::Subscriber<geometry_msgs::msg::PoseStamped>>(
+          node_, "grid_map/pose", rclcpp::QoS(25).get_rmw_qos_profile());
+
+      sync_image_pose_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImagePose>>(
+          SyncPolicyImagePose(100), *depth_sub_, *pose_sub_);
+      sync_image_pose_->registerCallback(
+          std::bind(&GridMap::depthPoseCallback, this, std::placeholders::_1, std::placeholders::_2));
+    }
+    else if (mp_.pose_type_ == ODOMETRY)
+    {
+      odom_sub_ = std::make_shared<message_filters::Subscriber<nav_msgs::msg::Odometry>>(
+          node_, "grid_map/odom", rclcpp::QoS(100).get_rmw_qos_profile());
+
+      sync_image_odom_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImageOdom>>(
+          SyncPolicyImageOdom(100), *depth_sub_, *odom_sub_);
+      sync_image_odom_->registerCallback(
+          std::bind(&GridMap::depthOdomCallback, this, std::placeholders::_1, std::placeholders::_2));
+    }
   }
 
   // 使用独立的里程计和点云订阅
@@ -189,6 +200,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   md_.has_first_depth_ = false;
   md_.has_odom_ = false;
   md_.has_cloud_ = false;
+  md_.has_processed_cloud_ = false;
   md_.image_cnt_ = 0;
   md_.last_occ_update_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
 
@@ -698,6 +710,19 @@ void GridMap::clearAndInflateLocalMap()
         md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
       }
   }
+
+  // Symmetric virtual floor -- see cloud-odometry path below for rationale
+  // (lidar vertical scan gap makes near-ground look free).
+  if (mp_.virtual_floor_height_ > mp_.map_origin_(2))
+  {
+    int floor_id = floor((mp_.virtual_floor_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_);
+    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
+      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+        for (int z = 0; z <= floor_id; ++z)
+        {
+          md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
+        }
+  }
 }
 
 void GridMap::visCallback()
@@ -912,6 +937,27 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
         md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
       }
   }
+
+  // Symmetric virtual floor: the 360 lidar's vertical scan gaps leave the
+  // near-ground region unobserved, which the rebound optimizer reads as free
+  // space and exploits as an escape route (paths hugging z~0). Fill every
+  // layer from the map bottom up to virtual_floor_height so ground-hugging
+  // plans are rejected outright.
+  if (mp_.virtual_floor_height_ > mp_.map_origin_(2)) {
+    int floor_id = floor((mp_.virtual_floor_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_);
+    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
+      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+        for (int z = 0; z <= floor_id; ++z) {
+          md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
+        }
+  }
+
+  // has_cloud_ flips true on the first cloud message even if it's then
+  // discarded above (no odom yet, zero points, NaN pose) -- this flag only
+  // flips once the occupancy buffer has actually been rebuilt from a real
+  // scan, which is the thing the FSM's pre-takeoff gate actually needs to
+  // know (see ego_replan_fsm.cpp's WAIT_TARGET case).
+  md_.has_processed_cloud_ = true;
 }
 
 void GridMap::publishMap()
@@ -1016,6 +1062,8 @@ void GridMap::publishMapInflate(bool all_info)
 bool GridMap::odomValid() { return md_.has_odom_; }
 
 bool GridMap::hasDepthObservation() { return md_.has_first_depth_; }
+
+bool GridMap::hasCloudObservation() { return md_.has_processed_cloud_; }
 
 Eigen::Vector3d GridMap::getOrigin() { return mp_.map_origin_; }
 

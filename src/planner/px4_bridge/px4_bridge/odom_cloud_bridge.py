@@ -55,6 +55,50 @@ class OdomCloudBridge(Node):
         self.declare_parameter('min_obstacle_range', 0.8)
         self._min_obstacle_range = self.get_parameter('min_obstacle_range').value
 
+        # PX4's EKF local origin sits at the vehicle's own spawn point, so in
+        # multi-vehicle runs each instance reports positions in its own frame.
+        # Cross-drone couplings (mutual avoidance, formation cost) need one
+        # shared world frame: add this drone's spawn position (world ENU) to
+        # every pose before republishing. Leave (0,0,0) if PX4 odometry is
+        # already world-referenced in your setup.
+        self.declare_parameter('spawn_x', 0.0)
+        self.declare_parameter('spawn_y', 0.0)
+        self._spawn_offset_enu = np.array([
+            self.get_parameter('spawn_x').value,
+            self.get_parameter('spawn_y').value,
+            0.0,
+        ])
+
+        # Neighbor-drone lidar returns must NOT reach the grid map: mutual
+        # avoidance runs on broadcast trajectories, not the map, so a painted
+        # neighbor (a ~1 m inflated column that jumps to a new position every
+        # scan) is pure poison -- any drone flying behind another storms with
+        # "Suddenly discovered obstacles" emergency stops against its
+        # formation partners (observed: 87 events on the trailing drone vs 0
+        # on the leading ones). Upstream ego-planner-swarm removes other
+        # drones from sensor data the same way (drone_detect). Points within
+        # neighbor_filter_radius of any other member's last known world
+        # position are dropped; the radius covers the airframe plus one
+        # scan-interval of neighbor motion at max_vel.
+        self.declare_parameter('drone_id', -1)
+        self.declare_parameter('formation_num', 0)
+        self.declare_parameter('neighbor_filter_radius', 1.0)
+        drone_id = self.get_parameter('drone_id').value
+        formation_num = self.get_parameter('formation_num').value
+        self._neighbor_filter_radius = self.get_parameter('neighbor_filter_radius').value
+        self._neighbor_pos = {}
+        if drone_id >= 0:
+            for j in range(formation_num):
+                if j == drone_id:
+                    continue
+                self.create_subscription(
+                    Odometry, f'/drone_{j}_px4_odom',
+                    lambda m, j=j: self._neighbor_pos.__setitem__(
+                        j, np.array([m.pose.pose.position.x,
+                                     m.pose.pose.position.y,
+                                     m.pose.pose.position.z])),
+                    10)
+
         px4_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -83,6 +127,8 @@ class OdomCloudBridge(Node):
         x, y, z = ned_to_enu_position(*msg.position)
         vx, vy, vz = ned_to_enu_velocity(*msg.velocity)
         q = frd_ned_quat_to_flu_enu_quat(msg.q)
+
+        x, y, z = np.array([x, y, z]) + self._spawn_offset_enu
 
         self._position_enu = np.array([x, y, z])
         self._velocity_enu = (vx, vy, vz)
@@ -137,6 +183,13 @@ class OdomCloudBridge(Node):
             return
 
         world_points = points @ self._rotation_enu.T + self._position_enu
+
+        # Drop returns from formation partners (see __init__).
+        for npos in self._neighbor_pos.values():
+            d2 = np.sum((world_points - npos) ** 2, axis=1)
+            world_points = world_points[d2 > self._neighbor_filter_radius ** 2]
+        if world_points.shape[0] == 0:
+            return
 
         out = point_cloud2.create_cloud_xyz32(msg.header, world_points.tolist())
         out.header.stamp = self.get_clock().now().to_msg()

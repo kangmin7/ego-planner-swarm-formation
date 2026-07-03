@@ -8,6 +8,7 @@
 #include <plan_env/obj_predictor.h>
 #include <rclcpp/rclcpp.hpp>
 #include "bspline_opt/lbfgs.hpp"
+#include <bspline_opt/swarm_graph.hpp>
 #include <traj_utils/plan_container.hpp>
 
 // Gradient and elasitc band optimization
@@ -165,6 +166,58 @@ namespace ego_planner
     double dist0_, swarm_clearance_; // safe distance
     double max_vel_, max_acc_;       // dynamic limits
 
+    /* formation (ported from ZJU-FAST-Lab/Swarm-Formation) */
+    SwarmGraph::Ptr swarm_graph_;
+    double lambda_formation_{0.0}; // formation similarity weight
+    int formation_type_{0};
+    int formation_size_{0};
+    bool use_formation_{false};
+
+    enum FORMATION_TYPE
+    {
+      NONE_FORMATION = 0,
+      REGULAR_HEXAGON = 1,
+      REGULAR_TRIANGLE = 2
+    };
+
+    void setDesiredFormation(int type)
+    {
+      std::vector<Eigen::Vector3d> swarm_des;
+      switch (type)
+      {
+      case FORMATION_TYPE::REGULAR_HEXAGON:
+      {
+        // 6 vertices around a centre drone, matching upstream Swarm-Formation
+        swarm_des.emplace_back(0, 0, 0);
+        swarm_des.emplace_back(1.7321, -1, 0);
+        swarm_des.emplace_back(0, -2, 0);
+        swarm_des.emplace_back(-1.7321, -1, 0);
+        swarm_des.emplace_back(-1.7321, 1, 0);
+        swarm_des.emplace_back(0, 2, 0);
+        swarm_des.emplace_back(1.7321, 1, 0);
+        break;
+      }
+      case FORMATION_TYPE::REGULAR_TRIANGLE:
+      {
+        // Equilateral wedge pointing +x (leader in front). The similarity
+        // metric is scale-invariant, so only the shape matters here.
+        swarm_des.emplace_back(0, 0, 0);
+        swarm_des.emplace_back(-3.4641, -2, 0);
+        swarm_des.emplace_back(-3.4641, 2, 0);
+        break;
+      }
+      case FORMATION_TYPE::NONE_FORMATION:
+      default:
+        use_formation_ = false;
+        formation_size_ = 0;
+        return;
+      }
+
+      formation_size_ = swarm_des.size();
+      use_formation_ = true;
+      swarm_graph_->setDesiredForm(swarm_des);
+    }
+
     int variable_num_;              // optimization variables
     int iter_num_;                  // iteration of the solver
     Eigen::VectorXd best_variable_; //
@@ -174,6 +227,12 @@ namespace ego_planner
 
 #define INIT_min_ellip_dist_ 123456789.0123456789
     double min_ellip_dist_;
+
+    // Wall time snapshotted once per rebound_optimize() run. The swarm and
+    // formation costs sample teammates' trajectories at absolute times; if
+    // they read the clock on every cost evaluation, the objective drifts
+    // between line-search probes and More-Thuente fails with -1007/-1008.
+    double opt_t_now_{0.0};
 
     ControlPoints cps_;
 
@@ -190,6 +249,7 @@ namespace ego_planner
     void calcDistanceCostRebound(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient, int iter_num, double smoothness_cost);
     void calcMovingObjCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     void calcSwarmCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
+    void calcFormationCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     void calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     bool check_collision_and_rebound(void);
 

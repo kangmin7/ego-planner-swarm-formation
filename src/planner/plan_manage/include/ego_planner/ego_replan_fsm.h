@@ -66,6 +66,16 @@ namespace ego_planner
     bool enable_fail_safe_;
     double min_takeoff_height_;
 
+    // Formation takeoff barrier: with staggered PX4 SITL instance boots the
+    // first drone's takeoff can complete tens of seconds before the last
+    // one's, and it then transits the whole field solo before the formation
+    // cost ever has a full trajectory buffer to act on. When formation_num_
+    // > 0, WAIT_TARGET additionally requires every member's odometry to
+    // report z >= min_takeoff_height_ so all planners start together.
+    int formation_num_{0};
+    std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> formation_odom_subs_;
+    std::vector<double> formation_odom_z_;
+
     /* planning data */
     bool have_trigger_, have_target_, have_odom_, have_new_target_, have_recv_pre_agent_;
     FSM_EXEC_STATE exec_state_;

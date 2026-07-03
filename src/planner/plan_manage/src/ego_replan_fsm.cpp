@@ -1,5 +1,6 @@
 
 #include <ego_planner/ego_replan_fsm.h>
+#include <limits>
 
 namespace ego_planner
 {
@@ -34,6 +35,11 @@ namespace ego_planner
     // never moved. Default -1 (disabled) preserves existing non-PX4 launches.
     node_->declare_parameter("fsm/min_takeoff_height", -1.0);
 
+    // Number of formation members (0 disables the formation takeoff
+    // barrier). Members are assumed to publish odometry on
+    // /drone_<i>_px4_odom, matching px4_single_run.launch.py's remapping.
+    node_->declare_parameter("fsm/formation_num", 0);
+
     node_->get_parameter("fsm/flight_type", target_type_);
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
     node_->get_parameter("fsm/thresh_no_replan_meter", no_replan_thresh_);
@@ -43,6 +49,7 @@ namespace ego_planner
     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
     node_->get_parameter("fsm/min_takeoff_height", min_takeoff_height_);
+    node_->get_parameter("fsm/formation_num", formation_num_);
 
     have_trigger_ = !flag_realworld_experiment_;
 
@@ -85,6 +92,24 @@ namespace ego_planner
           this->odometryCallback(msg);
         });
     // std::bind(&EGOReplanFSM::odometryCallback, this, std::placeholders::_1));
+
+    // Formation takeoff barrier: track every member's altitude (own drone
+    // included for index simplicity; its slot is refreshed by the same topic
+    // the main odom subscription uses).
+    if (formation_num_ > 0)
+    {
+      formation_odom_z_.assign(formation_num_, -std::numeric_limits<double>::infinity());
+      for (int i = 0; i < formation_num_; i++)
+      {
+        string topic = string("/drone_") + std::to_string(i) + string("_px4_odom");
+        formation_odom_subs_.push_back(node_->create_subscription<nav_msgs::msg::Odometry>(
+            topic, 1,
+            [this, i](const std::shared_ptr<const nav_msgs::msg::Odometry> &msg)
+            {
+              this->formation_odom_z_[i] = msg->pose.pose.position.z;
+            }));
+      }
+    }
 
     if (planner_manager_->pp_.drone_id >= 1)
     {
@@ -154,8 +179,36 @@ namespace ego_planner
 
       RCLCPP_WARN(node_->get_logger(), "Waiting for trigger from [n3ctrl] from RC");
 
-      while (rclcpp::ok() && (!have_odom_ || !have_trigger_ ||
-                              (min_takeoff_height_ > 0.0 && odom_pos_(2) < min_takeoff_height_)))
+      // This blocking gate must enforce the same conditions as the
+      // WAIT_TARGET case in execFSMCallback: once it exits, readGivenWps()
+      // -> planNextWaypoint() transitions straight to GEN_NEW_TRAJ ("TRIG")
+      // whenever the exec timer already moved INIT->WAIT_TARGET during the
+      // spin_some calls above -- *bypassing* the WAIT_TARGET gates. The
+      // timer wins that race whenever PX4 is already booted and odometry
+      // flows from the first spin. When it does and only the own-height
+      // check runs here, planning starts mid-climb against a still-empty
+      // map with formation members below altitude, and the resulting
+      // emergency-stop/retreat cascade can down the whole swarm.
+      auto blocked = [this]() {
+        if (!have_odom_ || !have_trigger_)
+          return true;
+        if (min_takeoff_height_ <= 0.0)
+          return false; // gate disabled (non-PX4 launches)
+        if (odom_pos_(2) < min_takeoff_height_)
+          return true;
+        // Don't start planning mid-climb: a first trajectory generated while
+        // the drone still has upward velocity begins with a hard pitch-over
+        // whose altitude dip can reach the virtual-floor / pillar-base band.
+        if (fabs(odom_vel_(2)) > 0.3)
+          return true;
+        if (!planner_manager_->grid_map_->hasCloudObservation())
+          return true;
+        for (int i = 0; i < formation_num_; i++)
+          if (formation_odom_z_[i] < min_takeoff_height_)
+            return true;
+        return false;
+      };
+      while (rclcpp::ok() && blocked())
       {
         rclcpp::spin_some(node_);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -533,10 +586,40 @@ namespace ego_planner
         goto force_return;
       if (min_takeoff_height_ > 0.0 && odom_pos_(2) < min_takeoff_height_)
         goto force_return;
-      else
+      // Same climb-settle condition as the PRESET_TARGET init gate (see
+      // init()): no first plan while vertical velocity is still large.
+      if (min_takeoff_height_ > 0.0 && fabs(odom_vel_(2)) > 0.3)
+        goto force_return;
+      // The altitude gate above only proves the drone is airworthy, not that
+      // the map has any real obstacle knowledge yet -- the lidar/cloud path
+      // has its own startup latency (first scan, first odom-gated process in
+      // GridMap::cloudCallback) independent of how fast the drone climbs.
+      // Without this, the very first trajectory can be planned against a
+      // still-empty occupancy grid that hasn't seen the pillars right in
+      // front of the spawn point yet, producing a straight-line path that
+      // rams the nearest one. min_takeoff_height_ <= 0.0 means this whole
+      // gate is disabled (non-PX4 launches), so skip this check too.
+      if (min_takeoff_height_ > 0.0 && !planner_manager_->grid_map_->hasCloudObservation())
+        goto force_return;
+      // Formation takeoff barrier: PX4 SITL instances boot (and their EKFs
+      // converge) tens of seconds apart, so without this the first drone
+      // transits the whole field solo before the formation cost ever has a
+      // complete trajectory buffer to hold the swarm together.
+      if (formation_num_ > 0 && min_takeoff_height_ > 0.0)
       {
-        changeFSMExecState(SEQUENTIAL_START, "FSM");
+        for (int i = 0; i < formation_num_; i++)
+        {
+          if (formation_odom_z_[i] < min_takeoff_height_)
+          {
+            static int wait_count = 0;
+            if (wait_count++ % 100 == 0)
+              RCLCPP_INFO(node_->get_logger(), "Formation barrier: waiting for drone %d to take off (z=%.2f)",
+                          i, formation_odom_z_[i]);
+            goto force_return;
+          }
+        }
       }
+      changeFSMExecState(SEQUENTIAL_START, "FSM");
       break;
     }
 
@@ -767,6 +850,15 @@ namespace ego_planner
           Eigen::Vector3d dir = target_pos - odom_pos_;
           double dist = dir.norm();
           Eigen::Vector3d retreat_pos = (dist > step_m) ? Eigen::Vector3d(odom_pos_ + dir / dist * step_m) : target_pos;
+
+          // Never retreat below the virtual floor: the oldest trail point
+          // can be the on-ground takeoff start (the occupancy check filters
+          // it from pos_history_, but the last-resort fallback above ignores
+          // occupancy), and stepping toward it is a controlled descent into
+          // the ground.
+          double vfloor = planner_manager_->grid_map_->getVirtualFloorHeight();
+          if (vfloor > planner_manager_->grid_map_->getOriginZ())
+            retreat_pos(2) = std::max(retreat_pos(2), vfloor + 0.3);
 
           RCLCPP_WARN(node_->get_logger(), "Stuck in obstacle during emergency stop, retreating (attempt %d, step %.2fm).",
                       retreat_attempt_count_, step_m);

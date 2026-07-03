@@ -20,6 +20,9 @@ namespace ego_planner
 
     node->declare_parameter("optimization/order", 3);
 
+    node->declare_parameter("optimization/lambda_formation", 0.0);
+    node->declare_parameter("optimization/formation_type", 0);
+
     node->get_parameter("optimization/lambda_smooth", lambda1_);
     node->get_parameter("optimization/lambda_collision", lambda2_);
     node->get_parameter("optimization/lambda_feasibility", lambda3_);
@@ -31,6 +34,19 @@ namespace ego_planner
     node->get_parameter("optimization/max_acc", max_acc_);
 
     node->get_parameter("optimization/order", order_);
+
+    node->get_parameter("optimization/lambda_formation", lambda_formation_);
+    node->get_parameter("optimization/formation_type", formation_type_);
+
+    swarm_graph_.reset(new SwarmGraph);
+    setDesiredFormation(formation_type_);
+    if (use_formation_ && lambda_formation_ <= 0.0)
+    {
+      RCLCPP_WARN(node->get_logger(),
+                  "formation_type=%d set but lambda_formation=%f, formation cost disabled",
+                  formation_type_, lambda_formation_);
+      use_formation_ = false;
+    }
   }
 
   void BsplineOptimizer::setEnvironment(const GridMap::Ptr &map)
@@ -876,7 +892,7 @@ namespace ego_planner
     cost = 0.0;
     int end_idx = q.cols() - order_ - (double)(q.cols() - 2 * order_) * 1.0 / 3.0; // Only check the first 2/3 points
     const double CLEARANCE = swarm_clearance_ * 2;
-    double t_now = rclcpp::Clock().now().seconds();
+    double t_now = opt_t_now_;
     constexpr double a = 2.0, b = 1.0, inv_a2 = 1 / a / a, inv_b2 = 1 / b / b;
 
     for (int i = order_; i < end_idx; i++)
@@ -920,6 +936,63 @@ namespace ego_planner
             min_ellip_dist_ = dist_err;
           }
         }
+      }
+    }
+  }
+
+  // Formation-similarity cost ported from ZJU-FAST-Lab/Swarm-Formation's
+  // swarmGraphGradCostP: at each checked control point, assemble the predicted
+  // swarm layout from every member's committed B-spline at the matching global
+  // time and penalize the graph-similarity distance to the desired formation.
+  void BsplineOptimizer::calcFormationCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient)
+  {
+    cost = 0.0;
+    if (!use_formation_ || swarm_trajs_ == NULL || drone_id_ >= formation_size_)
+      return;
+
+    // The graph needs all members: wait until every formation member has
+    // broadcast a trajectory (sequential start leaves early slots empty).
+    if ((int)swarm_trajs_->size() < formation_size_)
+      return;
+    for (int id = 0; id < formation_size_; id++)
+    {
+      if (id != drone_id_ && swarm_trajs_->at(id).drone_id != id)
+        return;
+    }
+
+    int end_idx = q.cols() - order_ - (double)(q.cols() - 2 * order_) * 1.0 / 3.0; // Only check the first 2/3 points
+    double t_now = opt_t_now_;
+
+    std::vector<Eigen::Vector3d> swarm_graph_pos(formation_size_);
+
+    for (int i = order_; i < end_idx; i++)
+    {
+      double glb_time = t_now + ((double)(order_ - 1) / 2 + (i - order_ + 1)) * bspline_interval_;
+
+      for (int id = 0; id < formation_size_; id++)
+      {
+        if (id == drone_id_)
+        {
+          swarm_graph_pos[id] = q.col(i);
+          continue;
+        }
+
+        // Past its trajectory end a teammate hovers at the final point, so
+        // clamp instead of skipping -- the graph needs all members.
+        double t_in_traj = glb_time - swarm_trajs_->at(id).start_time_.seconds();
+        t_in_traj = std::max(0.0, std::min(t_in_traj, swarm_trajs_->at(id).duration_));
+        swarm_graph_pos[id] = swarm_trajs_->at(id).position_traj_.evaluateDeBoorT(t_in_traj);
+      }
+
+      if (!swarm_graph_->updateGraph(swarm_graph_pos))
+        continue;
+
+      double similarity_error;
+      swarm_graph_->calcFNorm2(similarity_error);
+      if (similarity_error > 0)
+      {
+        cost += similarity_error;
+        gradient.col(i) += swarm_graph_->getGrad(drone_id_);
       }
     }
   }
@@ -1548,6 +1621,7 @@ namespace ego_planner
     variable_num_ = 3 * (end_id - start_id);
 
     rclcpp::Time t0 = rclcpp::Clock().now(), t1, t2;
+    opt_t_now_ = t0.seconds();
     int restart_nums = 0, rebound_times = 0;
     ;
     bool flag_force_return, flag_occ, success;
@@ -1807,7 +1881,7 @@ namespace ego_planner
     memcpy(cps_.points.data() + 3 * order_, x, n * sizeof(x[0]));
 
     /* ---------- evaluate cost and gradient ---------- */
-    double f_smoothness, f_distance, f_feasibility /*, f_mov_objs*/, f_swarm, f_terminal;
+    double f_smoothness, f_distance, f_feasibility /*, f_mov_objs*/, f_swarm, f_terminal, f_formation;
 
     Eigen::MatrixXd g_smoothness = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_distance = Eigen::MatrixXd::Zero(3, cps_.size);
@@ -1815,6 +1889,7 @@ namespace ego_planner
     // Eigen::MatrixXd g_mov_objs = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_swarm = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_terminal = Eigen::MatrixXd::Zero(3, cps_.size);
+    Eigen::MatrixXd g_formation = Eigen::MatrixXd::Zero(3, cps_.size);
 
     calcSmoothnessCost(cps_.points, f_smoothness, g_smoothness);
     calcDistanceCostRebound(cps_.points, f_distance, g_distance, iter_num_, f_smoothness);
@@ -1822,12 +1897,13 @@ namespace ego_planner
     // calcMovingObjCost(cps_.points, f_mov_objs, g_mov_objs);
     calcSwarmCost(cps_.points, f_swarm, g_swarm);
     calcTerminalCost(cps_.points, f_terminal, g_terminal);
+    calcFormationCost(cps_.points, f_formation, g_formation);
 
-    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal;
+    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal + lambda_formation_ * f_formation;
     // f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_mov_objs;
     // printf("origin %f %f %f %f\n", f_smoothness, f_distance, f_feasibility, f_combine);
 
-    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal;
+    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal + lambda_formation_ * g_formation;
     // Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_mov_objs;
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }

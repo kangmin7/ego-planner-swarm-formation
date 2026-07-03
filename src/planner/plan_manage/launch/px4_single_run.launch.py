@@ -48,6 +48,15 @@ def generate_launch_description():
     px4_ns = LaunchConfiguration('px4_ns', default='')
     px4_ns_cmd = DeclareLaunchArgument('px4_ns', default_value=px4_ns, description='PX4 topic namespace, e.g. /px4_1')
 
+    # This drone's spawn position in the shared world frame (ENU). PX4's EKF
+    # origin is the spawn point, so the bridges use this to convert between
+    # PX4-local and world coordinates -- required for anything that couples
+    # drones' absolute positions (mutual avoidance, formation cost).
+    spawn_x = LaunchConfiguration('spawn_x', default=0.0)
+    spawn_y = LaunchConfiguration('spawn_y', default=0.0)
+    spawn_x_cmd = DeclareLaunchArgument('spawn_x', default_value=spawn_x, description='Spawn x in world ENU')
+    spawn_y_cmd = DeclareLaunchArgument('spawn_y', default_value=spawn_y, description='Spawn y in world ENU')
+
     # PX4 SITL instance i has MAV_SYS_ID == i+1; VehicleCommand.target_system
     # must match it or the instance's commander ignores the command.
     target_system = LaunchConfiguration('target_system', default=1)
@@ -60,6 +69,18 @@ def generate_launch_description():
         'emergency_time', default_value=emergency_time, description='Emergency stop time window')
     swarm_clearance_cmd = DeclareLaunchArgument(
         'swarm_clearance', default_value=swarm_clearance, description='Min inter-drone clearance')
+
+    formation_type = LaunchConfiguration('formation_type', default=0)
+    lambda_formation = LaunchConfiguration('lambda_formation', default=0.0)
+    formation_num = LaunchConfiguration('formation_num', default=0)
+    formation_type_cmd = DeclareLaunchArgument(
+        'formation_type', default_value=formation_type,
+        description='Desired formation shape (0=none, 1=hexagon(7), 2=triangle(3))')
+    lambda_formation_cmd = DeclareLaunchArgument(
+        'lambda_formation', default_value=lambda_formation, description='Formation similarity cost weight')
+    formation_num_cmd = DeclareLaunchArgument(
+        'formation_num', default_value=formation_num,
+        description='Formation member count for the takeoff barrier (0 disables)')
 
     max_vel = LaunchConfiguration('max_vel', default=1.0)
     max_acc = LaunchConfiguration('max_acc', default=2.0)
@@ -75,14 +96,27 @@ def generate_launch_description():
     virtual_ceil_height_cmd = DeclareLaunchArgument(
         'virtual_ceil_height', default_value=virtual_ceil_height, description='Virtual ceiling height')
 
+    virtual_floor_height = LaunchConfiguration('virtual_floor_height', default=-1000.0)
+    virtual_floor_height_cmd = DeclareLaunchArgument(
+        'virtual_floor_height', default_value=virtual_floor_height,
+        description='Mark map cells below this z occupied (default disabled)')
+
     # offboard_bridge holds the drone in an in-place climb to ~1.5 m (TAKEOFF_ALT_M)
     # before it starts forwarding the planner's setpoints. Without this gate the
     # planner starts replanning from t=0 at node startup, several seconds before the
     # drone is physically off the ground -- see ego_replan_fsm.cpp's min_takeoff_height
     # comment for the full failure mode (planner's internal trajectory races ahead of
-    # the still-grounded real drone). 1.0 m is comfortably below the bridge's 1.5 m
-    # climb target so the planner is ready slightly before the bridge's handoff check.
-    min_takeoff_height = LaunchConfiguration('min_takeoff_height', default=1.0)
+    # the still-grounded real drone).
+    #
+    # Matched to the bridge's 1.5 m climb target (was 1.0 m, a 0.5 m head start) --
+    # at higher max_vel that half-metre gap let the planner's trajectory clock run for
+    # a second or two before handoff, so the very first forwarded setpoint could
+    # already carry near-max_vel velocity instead of starting from rest, producing a
+    # visible speed burst right as TRACKING begins. The bridge's handoff already waits
+    # for _have_position_cmd on top of the altitude check (offboard_bridge.py
+    # _s_takeoff), so matching the two altitudes exactly costs nothing -- the bridge
+    # simply holds the in-place climb a little longer if the planner isn't ready yet.
+    min_takeoff_height = LaunchConfiguration('min_takeoff_height', default=1.5)
     min_takeoff_height_cmd = DeclareLaunchArgument(
         'min_takeoff_height', default_value=min_takeoff_height,
         description='Min real altitude (odom z) before the planner starts its first trajectory')
@@ -114,7 +148,11 @@ def generate_launch_description():
             'point0_z': target_z,
             'emergency_time': emergency_time,
             'swarm_clearance': swarm_clearance,
+            'formation_type': formation_type,
+            'lambda_formation': lambda_formation,
+            'formation_num': formation_num,
             'virtual_ceil_height': virtual_ceil_height,
+            'virtual_floor_height': virtual_floor_height,
             'min_takeoff_height': min_takeoff_height,
         }.items()
     )
@@ -141,6 +179,12 @@ def generate_launch_description():
         parameters=[
             {'lidar_cloud_topic': lidar_cloud_topic},
             {'px4_ns': px4_ns},
+            {'spawn_x': spawn_x},
+            {'spawn_y': spawn_y},
+            # Enables neighbor-return filtering: formation partners must not
+            # be painted into the grid map (see odom_cloud_bridge.py).
+            {'drone_id': drone_id},
+            {'formation_num': formation_num},
         ],
         remappings=[
             ('~/odom', ['drone_', drone_id, '_', odom_topic]),
@@ -156,6 +200,8 @@ def generate_launch_description():
         parameters=[
             {'px4_ns': px4_ns},
             {'target_system': target_system},
+            {'spawn_x': spawn_x},
+            {'spawn_y': spawn_y},
         ],
         remappings=[
             ('position_cmd', ['drone_', drone_id, '_planning/pos_cmd']),
@@ -203,12 +249,18 @@ def generate_launch_description():
     ld.add_action(target_z_cmd)
     ld.add_action(lidar_cloud_topic_cmd)
     ld.add_action(px4_ns_cmd)
+    ld.add_action(spawn_x_cmd)
+    ld.add_action(spawn_y_cmd)
     ld.add_action(target_system_cmd)
     ld.add_action(emergency_time_cmd)
     ld.add_action(swarm_clearance_cmd)
+    ld.add_action(formation_type_cmd)
+    ld.add_action(lambda_formation_cmd)
+    ld.add_action(formation_num_cmd)
     ld.add_action(max_vel_cmd)
     ld.add_action(max_acc_cmd)
     ld.add_action(virtual_ceil_height_cmd)
+    ld.add_action(virtual_floor_height_cmd)
     ld.add_action(min_takeoff_height_cmd)
 
     ld.add_action(advanced_param_include)
