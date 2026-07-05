@@ -40,16 +40,17 @@ command -v MicroXRCEAgent >/dev/null || {
 cleanup() {
     echo
     echo "[formation] shutting down PX4 / agent / gazebo ..."
-    pkill -x px4 2>/dev/null || true
-    pkill -x MicroXRCEAgent 2>/dev/null || true
-    pkill -f 'gz sim' 2>/dev/null || true
+    # Surgical teardown only: this script's whole process tree is expected
+    # to run in its own session (launched via setsid); the caller kills that
+    # process group. Broad pkill patterns here have matched unrelated user
+    # processes (including the user's terminal session).
+    kill 0 2>/dev/null || true
 }
 trap cleanup INT TERM
 
 echo "[formation] stopping any previous PX4 / agent / gazebo ..."
-pkill -x px4 2>/dev/null || true
-pkill -x MicroXRCEAgent 2>/dev/null || true
-pkill -f 'gz sim' 2>/dev/null || true
+: # previous-instance cleanup removed: the campaign harness owns lifecycle
+: # via recorded process groups; broad pkill matched unrelated processes.
 sleep 2
 
 echo "[formation] starting Micro-XRCE-DDS agent on udp4 :$DDS_PORT"

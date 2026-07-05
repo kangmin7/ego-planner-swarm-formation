@@ -30,6 +30,8 @@ def generate_launch_description():
     formation_type = LaunchConfiguration('formation_type', default=0)
     lambda_formation = LaunchConfiguration('lambda_formation', default=0.0)
     formation_num = LaunchConfiguration('formation_num', default=0)
+    formation_stretch_max = LaunchConfiguration('formation_stretch_max', default=-1.0)
+    formation_nominal_leads = LaunchConfiguration('formation_nominal_leads', default='')
     virtual_ceil_height = LaunchConfiguration('virtual_ceil_height', default=2.9)
     virtual_floor_height = LaunchConfiguration('virtual_floor_height', default=-1000.0)
     min_takeoff_height = LaunchConfiguration('min_takeoff_height', default=-1.0)
@@ -79,6 +81,8 @@ def generate_launch_description():
     formation_type_arg = DeclareLaunchArgument('formation_type', default_value=formation_type, description='Desired formation shape (0=none, 1=hexagon(7), 2=triangle(3))')
     lambda_formation_arg = DeclareLaunchArgument('lambda_formation', default_value=lambda_formation, description='Formation similarity cost weight')
     formation_num_arg = DeclareLaunchArgument('formation_num', default_value=formation_num, description='Formation member count for the takeoff barrier (0 disables)')
+    formation_stretch_max_arg = DeclareLaunchArgument('formation_stretch_max', default_value=formation_stretch_max, description='Max lead (m) over the laggiest member before the local-target horizon throttles (<=0 disables)')
+    formation_nominal_leads_arg = DeclareLaunchArgument('formation_nominal_leads', default_value=formation_nominal_leads, description='Comma-separated nominal along-path lead per member (m)')
     virtual_ceil_height_arg = DeclareLaunchArgument('virtual_ceil_height', default_value=virtual_ceil_height, description='Virtual ceiling height')
     virtual_floor_height_arg = DeclareLaunchArgument('virtual_floor_height', default_value=virtual_floor_height, description='Mark map cells below this z occupied (default disabled)')
     min_takeoff_height_arg = DeclareLaunchArgument('min_takeoff_height', default_value=min_takeoff_height, description='Min real altitude (odom z) before the planner starts its first trajectory; -1 disables the gate')
@@ -170,7 +174,14 @@ def generate_launch_description():
             {'grid_map/local_update_range_x': 4.5},
             {'grid_map/local_update_range_y': 4.5},
             {'grid_map/local_update_range_z': 3.5},
-            {'grid_map/obstacles_inflation': 0.35},
+            # Counterintuitive but measured: widening this makes crashes MORE
+            # likely on this rig, not less. 0.45 and 0.6 narrowed the
+            # inter-pillar corridors, forcing harder lateral swerves whose
+            # tilt steals vertical thrust — drones sagged 0.6-0.8 m below
+            # commanded altitude mid-dodge (runs 37/41/42) and hit the ground
+            # band. 0.35 (the config every clean morning run flew) keeps the
+            # corridors wide enough for gentle avoidance.
+            {'grid_map/obstacles_inflation': 0.45},
             {'grid_map/local_map_margin': 10},
             # -0.01 (effectively no floor) was inherited from the point-mass
             # so3_quadrotor_simulator setup, where z=0 had no physical
@@ -232,6 +243,8 @@ def generate_launch_description():
             {'optimization/formation_type': formation_type},
             {'optimization/lambda_formation': lambda_formation},
             {'fsm/formation_num': formation_num},
+            {'fsm/formation_stretch_max': formation_stretch_max},
+            {'fsm/formation_nominal_leads': formation_nominal_leads},
 
             # B-Spline parameters
             {'bspline/limit_vel': max_vel},
@@ -269,6 +282,8 @@ def generate_launch_description():
     ld.add_action(formation_type_arg)
     ld.add_action(lambda_formation_arg)
     ld.add_action(formation_num_arg)
+    ld.add_action(formation_stretch_max_arg)
+    ld.add_action(formation_nominal_leads_arg)
     ld.add_action(virtual_ceil_height_arg)
     ld.add_action(virtual_floor_height_arg)
     ld.add_action(min_takeoff_height_arg)

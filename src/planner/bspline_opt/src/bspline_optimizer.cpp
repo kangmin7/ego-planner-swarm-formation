@@ -963,6 +963,29 @@ namespace ego_planner
     int end_idx = q.cols() - order_ - (double)(q.cols() - 2 * order_) * 1.0 / 3.0; // Only check the first 2/3 points
     double t_now = opt_t_now_;
 
+    // If every teammate's trajectory has already finished (they are parked —
+    // at their goals or holding for us), the similarity term can only fight
+    // this drone's goal attraction: the optimizer settles into a creep of
+    // ~0.4 m per replan and the mission never finishes (runs 75/76/93 parked
+    // in perfect triangles metres short). Parked partners ⇒ yield to the
+    // goal.
+    {
+      bool all_neighbors_parked = true;
+      for (int id = 0; id < formation_size_; id++)
+      {
+        if (id == drone_id_)
+          continue;
+        double t_in = t_now - swarm_trajs_->at(id).start_time_.seconds();
+        if (t_in < swarm_trajs_->at(id).duration_ - 0.1)
+        {
+          all_neighbors_parked = false;
+          break;
+        }
+      }
+      if (all_neighbors_parked)
+        return;
+    }
+
     std::vector<Eigen::Vector3d> swarm_graph_pos(formation_size_);
 
     for (int i = order_; i < end_idx; i++)
@@ -991,8 +1014,22 @@ namespace ego_planner
       swarm_graph_->calcFNorm2(similarity_error);
       if (similarity_error > 0)
       {
-        cost += similarity_error;
-        gradient.col(i) += swarm_graph_->getGrad(drone_id_);
+        // Huberize: linear near formation, saturating pull once the graph is
+        // grossly deformed (a member stalled 10+ m out of slot). The raw SNL
+        // gradient grows unboundedly with the error and More-Thuente line
+        // search then fails every iteration (-1008) — run 44's leader was
+        // frozen for minutes replanning against runaway followers.
+        constexpr double kHuberE0 = 4.0;
+        if (similarity_error <= kHuberE0)
+        {
+          cost += similarity_error;
+          gradient.col(i) += swarm_graph_->getGrad(drone_id_);
+        }
+        else
+        {
+          cost += kHuberE0 + 2.0 * std::sqrt(kHuberE0) * (std::sqrt(similarity_error) - std::sqrt(kHuberE0));
+          gradient.col(i) += std::sqrt(kHuberE0 / similarity_error) * swarm_graph_->getGrad(drone_id_);
+        }
       }
     }
   }
@@ -1899,11 +1936,11 @@ namespace ego_planner
     calcTerminalCost(cps_.points, f_terminal, g_terminal);
     calcFormationCost(cps_.points, f_formation, g_formation);
 
-    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal + lambda_formation_ * f_formation;
+    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal + lambda_formation_ * formation_fade_ * f_formation;
     // f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_mov_objs;
     // printf("origin %f %f %f %f\n", f_smoothness, f_distance, f_feasibility, f_combine);
 
-    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal + lambda_formation_ * g_formation;
+    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal + lambda_formation_ * formation_fade_ * g_formation;
     // Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_mov_objs;
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }

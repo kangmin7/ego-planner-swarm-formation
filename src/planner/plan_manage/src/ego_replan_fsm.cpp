@@ -39,6 +39,8 @@ namespace ego_planner
     // barrier). Members are assumed to publish odometry on
     // /drone_<i>_px4_odom, matching px4_single_run.launch.py's remapping.
     node_->declare_parameter("fsm/formation_num", 0);
+    node_->declare_parameter("fsm/formation_stretch_max", -1.0);
+    node_->declare_parameter("fsm/formation_nominal_leads", std::string(""));
 
     node_->get_parameter("fsm/flight_type", target_type_);
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
@@ -50,6 +52,16 @@ namespace ego_planner
     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
     node_->get_parameter("fsm/min_takeoff_height", min_takeoff_height_);
     node_->get_parameter("fsm/formation_num", formation_num_);
+    node_->get_parameter("fsm/formation_stretch_max", formation_stretch_max_);
+    {
+      std::string leads_str;
+      node_->get_parameter("fsm/formation_nominal_leads", leads_str);
+      std::stringstream ss(leads_str);
+      std::string tok;
+      while (std::getline(ss, tok, ','))
+        if (!tok.empty())
+          formation_nominal_leads_.push_back(std::stod(tok));
+    }
 
     have_trigger_ = !flag_realworld_experiment_;
 
@@ -99,6 +111,7 @@ namespace ego_planner
     if (formation_num_ > 0)
     {
       formation_odom_z_.assign(formation_num_, -std::numeric_limits<double>::infinity());
+      formation_odom_pos_.assign(formation_num_, Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN()));
       for (int i = 0; i < formation_num_; i++)
       {
         string topic = string("/drone_") + std::to_string(i) + string("_px4_odom");
@@ -107,6 +120,9 @@ namespace ego_planner
             [this, i](const std::shared_ptr<const nav_msgs::msg::Odometry> &msg)
             {
               this->formation_odom_z_[i] = msg->pose.pose.position.z;
+              this->formation_odom_pos_[i] = Eigen::Vector3d(msg->pose.pose.position.x,
+                                                             msg->pose.pose.position.y,
+                                                             msg->pose.pose.position.z);
             }));
       }
     }
@@ -740,7 +756,17 @@ namespace ego_planner
       }
       else if ((local_target_pt_ - end_pt_).norm() < 1e-3) // close to the global target
       {
-        if (t_cur > info->duration_ - 1e-2)
+        if (t_cur > info->duration_ - 1e-2 && (end_pt_ - odom_pos_).norm() > 1.0)
+        {
+          // The trajectory finished but the VEHICLE isn't at the goal: the
+          // final segment can legally get truncated (swarm clearance as the
+          // formation converges) and the old check declared mission-complete
+          // metres short (run 75: two drones parked 1.8-2.3 m from their
+          // targets). Close the gap instead of quitting.
+          if (t_elapsed > replan_thresh_ && !stretchHoldActive())
+            changeFSMExecState(REPLAN_TRAJ, "FSM");
+        }
+        else if (t_cur > info->duration_ - 1e-2)
         {
           have_target_ = false;
           have_trigger_ = false;
@@ -754,12 +780,12 @@ namespace ego_planner
           changeFSMExecState(WAIT_TARGET, "FSM");
           goto force_return;
         }
-        else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_elapsed > replan_thresh_)
+        else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_elapsed > replan_thresh_ && !stretchHoldActive())
         {
           changeFSMExecState(REPLAN_TRAJ, "FSM");
         }
       }
-      else if (t_elapsed > replan_thresh_)
+      else if (t_elapsed > replan_thresh_ && !stretchHoldActive())
       {
         changeFSMExecState(REPLAN_TRAJ, "FSM");
       }
@@ -859,6 +885,12 @@ namespace ego_planner
           double vfloor = planner_manager_->grid_map_->getVirtualFloorHeight();
           if (vfloor > planner_manager_->grid_map_->getOriginZ())
             retreat_pos(2) = std::max(retreat_pos(2), vfloor + 0.3);
+          // ...and never retreat above the virtual ceiling either: trail
+          // points recorded while the drone was blown above the ceiling
+          // would otherwise walk the commands even higher (run 30).
+          double vceil = planner_manager_->grid_map_->getVirtualCeilHeight();
+          if (vceil > -0.5)
+            retreat_pos(2) = std::min(retreat_pos(2), vceil - 0.3);
 
           RCLCPP_WARN(node_->get_logger(), "Stuck in obstacle during emergency stop, retreating (attempt %d, step %.2fm).",
                       retreat_attempt_count_, step_m);
@@ -894,6 +926,50 @@ namespace ego_planner
     start_vel_ = odom_vel_;
     start_acc_.setZero();
 
+    // If tracking error let the drone physically sink into the virtual-floor
+    // band, its own position is "occupied" and every replan dies with
+    // "First 3 control points in obstacles" — observed as a drone wedged in
+    // place for 40+ s. Start the plan just above the floor instead: the
+    // commanded trajectory then pulls the drone back out of the band.
+    double vfloor = planner_manager_->grid_map_->getVirtualFloorHeight();
+    if (vfloor > planner_manager_->grid_map_->getOriginZ() && start_pt_(2) < vfloor + 0.1)
+      start_pt_(2) = vfloor + 0.1;
+    // Symmetrically, a drone blown ABOVE the virtual ceiling must plan from
+    // just below it, or its start is permanently "occupied" and it can only
+    // drift further up (run 30's z=5.2 command runaway).
+    double vceil = planner_manager_->grid_map_->getVirtualCeilHeight();
+    if (vceil > -0.5 && start_pt_(2) > vceil - 0.1)
+      start_pt_(2) = vceil - 0.1;
+
+    // Same wedge, lateral flavor: a drone holding position (stretch governor)
+    // or blown off course can end up inside a pillar's *inflated* band while
+    // physically fine — every replan then fails and it freezes (drone 0 stuck
+    // for minutes at x=10 in run 29). Lift the plan start to the nearest free
+    // cell so the commanded trajectory pulls the drone out. dz scans both
+    // directions so the escape can duck under as well as climb over.
+    if (planner_manager_->grid_map_->getInflateOccupancy(start_pt_))
+    {
+      const double res = planner_manager_->grid_map_->getResolution();
+      bool found = false;
+      for (double r = res; r <= 2.0 + 1e-3 && !found; r += res)
+      {
+        int n_steps = std::max(8, (int)std::ceil(2 * M_PI * r / res));
+        for (int k = 0; k < n_steps && !found; k++)
+        {
+          double th = 2 * M_PI * k / n_steps;
+          for (double dz = -2 * res; dz <= 2 * res + 1e-3 && !found; dz += res)
+          {
+            Eigen::Vector3d cand = start_pt_ + Eigen::Vector3d(r * cos(th), r * sin(th), dz);
+            if (!planner_manager_->grid_map_->getInflateOccupancy(cand))
+            {
+              start_pt_ = cand;
+              found = true;
+            }
+          }
+        }
+      }
+    }
+
     bool flag_random_poly_init;
     if (timesOfConsecutiveStateCalls().first == 1)
       flag_random_poly_init = false;
@@ -922,6 +998,19 @@ namespace ego_planner
     start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
     start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+
+    // The trajectory clock keeps running while the vehicle may be physically
+    // held up (obstacle fight, tracking lag): the evaluated start can end up
+    // many meters ahead of the real drone, and each replan then chains from
+    // fiction — commanded setpoints jump and the vehicle dashes at over-limit
+    // speed to catch up (runs 62-64: 9 m jumps, 2.3 m/s dashes into the
+    // ground). If the trajectory has raced ahead, replan from reality.
+    if ((start_pt_ - odom_pos_).norm() > 1.5)
+    {
+      start_pt_ = odom_pos_;
+      start_vel_ = odom_vel_;
+      start_acc_.setZero();
+    }
 
     bool success = callReboundReplan(false, false);
 
@@ -1221,9 +1310,66 @@ namespace ego_planner
     return true;
   }
 
+  // Formation stretch governor, hard-hold flavor: true when this drone is
+  // already well past the leash. Distance-based target clamping alone cannot
+  // stop a drone (each replan re-extends 0.5 m from wherever it is — run 44's
+  // followers crept 1 m/s to 15 m past a stalled leader), so past this point
+  // the FSM simply stops issuing periodic replans: the current trajectory
+  // runs out and the drone hovers at its end until the laggard catches up.
+  // Collision/emergency replans are unaffected.
+  bool EGOReplanFSM::stretchHoldActive()
+  {
+    if (formation_num_ <= 0 || formation_stretch_max_ <= 0.0)
+      return false;
+    Eigen::Vector3d dir = end_pt_ - odom_pos_;
+    if (dir.norm() <= 1.0)
+      return false;
+    dir.normalize();
+    auto nominal = [this](int i) {
+      return (int)formation_nominal_leads_.size() > i ? formation_nominal_leads_[i] : 0.0;
+    };
+    int self = planner_manager_->pp_.drone_id;
+    double lead = 0.0;
+    for (int i = 0; i < formation_num_; i++)
+    {
+      if (i == self || !formation_odom_pos_[i].allFinite())
+        continue;
+      // excess lead relative to the desired formation geometry
+      lead = std::max(lead, (odom_pos_ - formation_odom_pos_[i]).dot(dir) - (nominal(self) - nominal(i)));
+    }
+    bool want_hold = lead > formation_stretch_max_ + 1.0;
+
+    // Pressure valve: a hold must not be able to freeze the swarm forever.
+    // If the laggard is itself blocked by the holders' geometry, everyone
+    // waits politely for eternity (run 87 gridlocked mid-field with zero
+    // planner errors). Cap continuous holding at 30 s, then force 10 s of
+    // freedom before re-evaluating.
+    constexpr double kMaxHoldSec = 30.0, kReleaseSec = 10.0;
+    double now = node_->get_clock()->now().seconds();
+    if (!want_hold)
+    {
+      stretch_hold_since_ = -1.0;
+      return false;
+    }
+    if (stretch_hold_release_until_ > now)
+      return false;
+    if (stretch_hold_since_ < 0.0)
+      stretch_hold_since_ = now;
+    if (now - stretch_hold_since_ > kMaxHoldSec)
+    {
+      stretch_hold_release_until_ = now + kReleaseSec;
+      stretch_hold_since_ = -1.0;
+      return false;
+    }
+    return true;
+  }
+
   void EGOReplanFSM::getLocalTarget()
   {
     double t;
+
+    double horizen = planning_horizen_;
+    bool stretch_throttled = false;
 
     double t_step = planning_horizen_ / 20 / planner_manager_->pp_.max_vel_;
     double dist_min = 9999, dist_min_t = 0.0;
@@ -1232,14 +1378,14 @@ namespace ego_planner
       Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(t);
       double dist = (pos_t - start_pt_).norm();
 
-      if (t < planner_manager_->global_data_.last_progress_time_ + 1e-5 && dist > planning_horizen_)
+      if (t < planner_manager_->global_data_.last_progress_time_ + 1e-5 && dist > horizen)
       {
         // Important cornor case!
         for (; t < planner_manager_->global_data_.global_duration_; t += t_step)
         {
           Eigen::Vector3d pos_t_temp = planner_manager_->global_data_.getPosition(t);
           double dist_temp = (pos_t_temp - start_pt_).norm();
-          if (dist_temp < planning_horizen_)
+          if (dist_temp < horizen)
           {
             pos_t = pos_t_temp;
             dist = (pos_t - start_pt_).norm();
@@ -1255,17 +1401,64 @@ namespace ego_planner
         dist_min_t = t;
       }
 
-      if (dist >= planning_horizen_)
+      if (dist >= horizen)
       {
         local_target_pt_ = pos_t;
         planner_manager_->global_data_.last_progress_time_ = dist_min_t;
         break;
       }
     }
-    if (t > planner_manager_->global_data_.global_duration_) // Last global point
+    // >= (was >): once last_progress_time_ has reached global_duration_ the
+    // sampling loop above never runs and t stays EXACTLY equal to the
+    // duration — with strict >, neither branch set local_target_pt_, leaving
+    // it stale at the previous value. Post-arrival correction replans then
+    // abort forever with "Close to goal" (run 105: 49k no-op replans while a
+    // drone parked 3 m short of its goal).
+    if (t >= planner_manager_->global_data_.global_duration_ - 1e-9) // Last global point
     {
       local_target_pt_ = end_pt_;
       planner_manager_->global_data_.last_progress_time_ = planner_manager_->global_data_.global_duration_;
+    }
+
+    // Formation stretch governor (see header): pin the local target to at
+    // most formation_stretch_max_ ahead of the laggiest member (projected on
+    // this drone's goal direction). Clamping the *target point* (rather than
+    // shrinking the lookahead) makes the leash independent of replan
+    // frequency: while the straggler is stopped the clamped target is a
+    // fixed point in space, so the leader decelerates and holds there. The
+    // straggler itself always measures lead <= 0 and is never clamped, so
+    // this cannot deadlock. Runs before the occupancy fallback below so a
+    // clamped point inside an obstacle still gets relocated to free space.
+    if (formation_num_ > 0 && formation_stretch_max_ > 0.0 &&
+        stretch_hold_release_until_ <= node_->get_clock()->now().seconds())
+    {
+      Eigen::Vector3d dir = end_pt_ - odom_pos_;
+      if (dir.norm() > 1.0)
+      {
+        dir.normalize();
+        auto nominal = [this](int i) {
+          return (int)formation_nominal_leads_.size() > i ? formation_nominal_leads_[i] : 0.0;
+        };
+        int self = planner_manager_->pp_.drone_id;
+        double target_lead = 0.0;
+        for (int i = 0; i < formation_num_; i++)
+        {
+          if (i == self || !formation_odom_pos_[i].allFinite())
+            continue;
+          // excess lead relative to the desired formation geometry
+          target_lead = std::max(target_lead, (local_target_pt_ - formation_odom_pos_[i]).dot(dir) - (nominal(self) - nominal(i)));
+        }
+        if (target_lead > formation_stretch_max_)
+        {
+          local_target_pt_ -= dir * (target_lead - formation_stretch_max_);
+          // Never plan meaningfully backward: if the drone itself already
+          // overshot the leash, hold just ahead of where it is instead.
+          double fwd = (local_target_pt_ - start_pt_).dot(dir);
+          if (fwd < 0.5)
+            local_target_pt_ += dir * (0.5 - fwd);
+          stretch_throttled = true;
+        }
+      }
     }
 
     // getLocalTarget() just samples the naive straight-line global reference at
@@ -1334,7 +1527,18 @@ namespace ego_planner
       local_target_pt_ = best_pt;
     }
 
-    if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))
+    // Throttled plans must decelerate to a stop at the leashed target. This
+    // branch must come FIRST: when the pre-clamp target was the global goal,
+    // t has already run past global_duration_, and getVelocity(t) beyond the
+    // duration indexes the never-populated local_traj_[0] — a garbage
+    // UniformBspline whose getTimeSpan segfaults (took down both follower
+    // planners in run 28). The original code only avoided that path via the
+    // close-to-goal check below, which the clamp invalidates.
+    if (stretch_throttled)
+    {
+      local_target_vel_ = Eigen::Vector3d::Zero();
+    }
+    else if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))
     {
       local_target_vel_ = Eigen::Vector3d::Zero();
     }

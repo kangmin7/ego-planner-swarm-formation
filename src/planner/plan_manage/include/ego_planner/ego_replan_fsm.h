@@ -75,6 +75,26 @@ namespace ego_planner
     int formation_num_{0};
     std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> formation_odom_subs_;
     std::vector<double> formation_odom_z_;
+    // Formation stretch governor: the B-spline optimizer can bend paths but
+    // cannot re-time them, so no formation-cost weight can make a lead drone
+    // *wait* for a member that emergency-stopped — the wedge just stretches
+    // (observed 16-20 m). When this drone leads the laggiest member (projected
+    // on its direction to goal) by more than formation_stretch_max_, the
+    // local-target horizon shrinks progressively so it creeps until the
+    // straggler catches up. <= 0 disables. Threshold must exceed the nominal
+    // in-formation lead (leader sits 3.46 m ahead of the wing drones).
+    double formation_stretch_max_{-1.0};
+    std::vector<Eigen::Vector3d> formation_odom_pos_;
+    // Per-member nominal along-path lead (m) in the desired formation (apex
+    // 0, wings -3.464 for the triangle). The governor measures EXCESS lead
+    // relative to these: a wing 3.7 m AHEAD of the apex is 7 m out of slot
+    // even though its raw lead looks small — unchecked, the wings overtake
+    // and the rotation-invariant formation cost happily locks in an inverted
+    // triangle (run 76).
+    std::vector<double> formation_nominal_leads_;
+    // stretch-hold pressure valve state (see stretchHoldActive())
+    double stretch_hold_since_{-1.0};
+    double stretch_hold_release_until_{-1.0};
 
     /* planning data */
     bool have_trigger_, have_target_, have_odom_, have_new_target_, have_recv_pre_agent_;
@@ -135,6 +155,7 @@ namespace ego_planner
     void readGivenWps();
     void planNextWaypoint(const Eigen::Vector3d next_wp);
     void getLocalTarget();
+    bool stretchHoldActive();
 
     /* ROS functions */
     void execFSMCallback();

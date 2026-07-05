@@ -201,6 +201,7 @@ public:
   // occupancy-update paths); callers needing a safe altitude floor should
   // treat values <= origin z as "no floor".
   double getVirtualFloorHeight() { return mp_.virtual_floor_height_; }
+  double getVirtualCeilHeight() { return mp_.virtual_ceil_height_; }
   double getOriginZ() { return mp_.map_origin_(2); }
 
   typedef std::shared_ptr<GridMap> Ptr;
@@ -364,19 +365,25 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos)
 
 inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
 {
-  if (!isInMap(pos))
-    return -1;
-
   // Geometric virtual floor/ceiling: the per-scan voxel fill only covers each
   // scan's local bound box, so trajectory segments beyond current scan
   // coverage saw unknown (= free) space near the ground and the optimizer
   // dove into the lidar's near-ground blind band (a follower was commanded
   // to z=0.8 and flown into the ground). Enforcing the bounds here makes
   // them hold everywhere, independent of scan coverage.
+  //
+  // These checks deliberately run BEFORE isInMap: several consumers (A*'s
+  // checkOccupancy among them) treat the out-of-map -1 as traversable, so a
+  // drone pushed above the map's top plane would otherwise see infinite free
+  // space up there and plan through it (run 30: commands walked up to
+  // z=5.2 against a 3.0 ceiling).
   if (mp_.virtual_floor_height_ > mp_.map_origin_(2) && pos(2) < mp_.virtual_floor_height_)
     return 1;
   if (mp_.virtual_ceil_height_ > -0.5 && pos(2) > mp_.virtual_ceil_height_)
     return 1;
+
+  if (!isInMap(pos))
+    return -1;
 
   Eigen::Vector3i id;
   posToIndex(pos, id);

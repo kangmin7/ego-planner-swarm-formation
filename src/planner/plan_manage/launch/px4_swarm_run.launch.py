@@ -64,16 +64,28 @@ def generate_launch_description():
                 # PX4 SITL instance i has MAV_SYS_ID == i+1.
                 'target_system': str(i + 1),
                 'lidar_cloud_topic': lidar_cloud_topic,
-                'spawn_x': str(cfg['spawn_x']),
-                'spawn_y': str(cfg['spawn_y']),
+                # 0.0 (not the physical spawn pose): with external-vision
+                # state estimation the PX4 local frame IS the shared world
+                # frame — gz_bridge feeds the EKF world-frame ground-truth
+                # odometry — so the bridges' spawn-offset reconciliation
+                # must be disabled. Physical spawn poses still live in
+                # start_formation_sitl.sh.
+                'spawn_x': str(0.0),
+                'spawn_y': str(0.0),
                 'map_size_x': str(110.0),
                 'map_size_y': str(65.0),
                 'map_size_z': str(5.0),
                 'target_x': str(cfg['target_x']),
                 'target_y': str(cfg['target_y']),
-                'target_z': str(2.0),
+                'target_z': str(2.6),
                 'emergency_time': str(2.0),
-                'swarm_clearance': str(1.5),
+                # 1.0 (was 1.5): the field's narrowest gate (pillars 70/71 at x~15)
+                # leaves a ~3 m corridor; a 1.5 m clearance floor makes the
+                # triangle's minimum footprint 3 m and the swarm physically
+                # cannot compress through — every run ground against that
+                # conflict there until someone grazed a pillar. 2 m pairwise
+                # is safe with truth-grade estimation and capped speeds.
+                'swarm_clearance': str(1.0),
                 'formation_type': str(2),
                 'formation_num': str(3),
                 # Tuning history: 10.0 kept the optimizer healthy but was too
@@ -84,31 +96,53 @@ def generate_launch_description():
                 # small). 100.0 held a tight 4-5 m triangle through the first
                 # third of the pillar field but overrode obstacle/mutual
                 # avoidance around x~20: drones 0 and 1 crashed.
+                # 45.0 held a marginally tighter moving shape but pushed
+                # followers into violent weaves through neighbors' lanes near
+                # pillars (run 27 loss); the stretch governor below is what
+                # actually fixes formation blow-ups, so keep the weight at the
+                # proven-gentle 30.
                 'lambda_formation': str(30.0),
+                # Stretch governor: leaders throttle their lookahead once they
+                # lead the laggiest member by more than this. Nominal triangle
+                # already puts the apex 3.46 m ahead of the wings, so this
+                # must sit comfortably above that.
+                'formation_stretch_max': str(6.0),
+                # apex leads, wings trail by the triangle depth
+                'formation_nominal_leads': '0,-3.464,-3.464',
                 # Slower than the 5.0 used for independent parallel lanes:
                 # formation keeping adds coupling between the drones'
                 # replans, and PX4 tracking lag at high speed shows up as
                 # formation error the optimizer then chases. 3.0 still
                 # crashed a follower mid-field (hard sideways dodge across
                 # the leader's lane at max speed left no tracking margin).
-                'max_vel': str(2.0),
+                # 2.0 produced ~0.5-0.9 m tracking errors during hard avoidance
+                # maneuvers on the loaded sim host — enough to dip below the
+                # floor band or clip pillars (runs 27/35). 1.5 keeps the PX4
+                # position controller comfortably inside the 0.45 m inflation.
+                'max_vel': str(1.2),
                 # 5.0 pitched the vehicle over hard enough at the
                 # takeoff->planner handoff (and on mid-field dodges) to dump
                 # ~0.5-0.7 m of altitude into the lidar-blind near-ground
                 # band; one drone clipped a pillar base and was lost.
-                'max_acc': str(3.0),
+                # 3.0 still allowed evasive swerves steep enough to sag 0.5+ m
+                # of altitude (thrust tilt) at close quarters; 2.0 trades a
+                # slower dodge for staying level (run 49's d2 dive).
+                'max_acc': str(2.0),
                 # Must sit inside [TAKEOFF_ALT_M - TAKEOFF_TOLERANCE_M,
                 # TAKEOFF_ALT_M] of offboard_bridge.py (2.5 / 0.3): planning
                 # may only start once the bridge's climb is essentially done,
                 # and the bridge hands off to planner tracking at 2.2.
-                'min_takeoff_height': str(2.2),
+                'min_takeoff_height': str(2.7),
                 # Keep plans well below the 4.0 m pillar tops: with 4.3 the
                 # optimizer escaped vertically to ~3.8 and the steep dive back
                 # to cruise overshot into the ground/pillar band (run 20 loss).
-                'virtual_ceil_height': str(3.0),
+                'virtual_ceil_height': str(3.4),
                 # Fence off the lidar's near-ground blind band (map starts at
                 # ground_height=0.5) so escape plans can't hug the floor.
-                'virtual_floor_height': str(1.5),
+                # 1.5 still let the optimizer command z≈1.9-2.0; with ~0.5-1 m
+                # of downward tracking sag under load that reached the ground
+                # (runs 35/37). 1.8 keeps worst-case sag above ~1 m altitude.
+                'virtual_floor_height': str(2.3),
             }.items()
         )
         ld.add_action(drone_launch)

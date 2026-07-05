@@ -61,6 +61,14 @@ namespace ego_planner
     static int count = 0;
     printf("\033[47;30m\n[drone %d replan %d]==============================================\033[0m\n", pp_.drone_id, count++);
 
+    if (!start_pt.allFinite() || !local_target_pt.allFinite() ||
+        !start_vel.allFinite() || !local_target_vel.allFinite())
+    {
+      RCLCPP_ERROR(rclcpp::get_logger("rebound_replan"), "non-finite start/target, rejecting replan");
+      continous_failures_count_++;
+      return false;
+    }
+
     if ((start_pt - local_target_pt).norm() < 0.2)
     {
       cout << "Close to goal" << endl;
@@ -69,6 +77,17 @@ namespace ego_planner
     }
 
     bspline_optimizer_->setLocalTargetPt(local_target_pt);
+
+    // Fade the formation cost out over the last ~8 m to the mission goal:
+    // the goal positions themselves encode the formation, and keeping the
+    // (rotation-invariant) similarity term at full strength near them lets
+    // the swarm park in a perfect-but-misoriented shape short of the targets
+    // (run 76). Full strength in the field, pure goal attraction at the end.
+    // Zero within 6 m of one's own goal, full beyond 12 m: softer schedules
+    // left enough similarity pull to hold drones in yield/re-engage creep
+    // loops metres short of their targets (runs 93/95).
+    double dist_to_goal = (global_data_.getPosition(global_data_.global_duration_) - start_pt).norm();
+    bspline_optimizer_->setFormationFade((dist_to_goal - 6.0) / 6.0);
 
     rclcpp::Time t_start = rclcpp::Clock().now();
     rclcpp::Duration t_init(0, 0), t_opt(0, 0), t_refine(0, 0);
@@ -122,8 +141,19 @@ namespace ego_planner
         double t;
         bool flag_too_far;
         ts *= 1.5; // ts will be divided by 1.5 in the next
+        int sample_retries = 0;
         do
         {
+          // Degenerate inputs (time ~ 0, NaN geometry) never accumulate 7
+          // points no matter how small ts gets; without a cap this loop spins
+          // forever inside the FSM timer and the drone freezes mid-air with
+          // its last command held (runs 50/51 deadlocks).
+          if (++sample_retries > 60)
+          {
+            RCLCPP_ERROR(rclcpp::get_logger("rebound_replan"), "init sampling failed to converge, rejecting replan");
+            continous_failures_count_++;
+            return false;
+          }
           ts /= 1.5;
           point_set.clear();
           flag_too_far = false;
@@ -189,16 +219,43 @@ namespace ego_planner
           }
         }
 
+        // A drone that has been hovering at the end of its trajectory (stretch
+        // governor hold, or wedged) has t_cur past duration_ AND its next
+        // target within ~ts of travel: both sampling loops above then push
+        // nothing, pseudo_arc_length stays at its single seed element, and
+        // "id <= size() - 2" below underflows (unsigned) into an unbounded
+        // walk over the empty segment_point — segfault (run 31, all drones).
+        // Regenerate from a fresh polynomial instead.
+        // ...and the all-zero flavor: a hovering drone's remaining trajectory
+        // samples to identical points, pseudo_arc_length stays 0 everywhere,
+        // the interval test below never admits a sample, and the
+        // "while (point_set.size() < 7)" loop spins forever — the planner
+        // thread hangs mid-replan (run 50 deadlocked all three drones).
+        if (pseudo_arc_length.size() < 2 || pseudo_arc_length.back() < 0.1)
+        {
+          flag_force_polynomial = true;
+          flag_regenerate = true;
+          continue;
+        }
+
         double sample_length = 0;
         double cps_dist = pp_.ctrl_pt_dist * 1.5; // cps_dist will be divided by 1.5 in the next
         size_t id = 0;
+        int seg_retries = 0;
         do
         {
+          // Same convergence cap as the polynomial branch above.
+          if (++seg_retries > 60)
+          {
+            RCLCPP_ERROR(rclcpp::get_logger("rebound_replan"), "segment resampling failed to converge, rejecting replan");
+            continous_failures_count_++;
+            return false;
+          }
           cps_dist /= 1.5;
           point_set.clear();
           sample_length = 0;
           id = 0;
-          while ((id <= pseudo_arc_length.size() - 2) && sample_length <= pseudo_arc_length.back())
+          while ((id + 2 <= pseudo_arc_length.size()) && sample_length <= pseudo_arc_length.back())
           {
             if (sample_length >= pseudo_arc_length[id] && sample_length < pseudo_arc_length[id + 1])
             {
@@ -358,6 +415,17 @@ namespace ego_planner
 
   bool EGOPlannerManager::EmergencyStop(Eigen::Vector3d stop_pos)
   {
+    // The stop point extrapolates current motion with no occupancy check: a
+    // drone that emergency-stops mid-dive gets commanded below the virtual
+    // floor and flies into the ground band (run 49: cmd z=1.17 with a 1.8 m
+    // floor). Clamp into the legal altitude band.
+    double vfloor = grid_map_->getVirtualFloorHeight();
+    if (vfloor > grid_map_->getOriginZ())
+      stop_pos(2) = std::max(stop_pos(2), vfloor + 0.1);
+    double vceil = grid_map_->getVirtualCeilHeight();
+    if (vceil > -0.5)
+      stop_pos(2) = std::min(stop_pos(2), vceil - 0.1);
+
     Eigen::MatrixXd control_points(3, 6);
     for (int i = 0; i < 6; i++)
     {

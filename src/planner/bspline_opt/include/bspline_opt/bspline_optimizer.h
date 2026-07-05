@@ -110,6 +110,13 @@ namespace ego_planner
     void setWaypoints(const vector<Eigen::Vector3d> &waypts,
                       const vector<int> &waypt_idx); // N-2 constraints at most
     void setLocalTargetPt(const Eigen::Vector3d local_target_pt) { local_target_pt_ = local_target_pt; };
+    // Formation-cost fade [0..1]: near the mission goals the target positions
+    // themselves encode the formation, and a full-strength similarity term
+    // only builds barriers against the final approach (run 76: a perfect but
+    // INVERTED triangle parked 2 m short — rotation-invariance made it a cost
+    // minimum and the leader couldn't swap through the wings). The manager
+    // sets this to dist_to_goal/8, clamped.
+    void setFormationFade(double f) { formation_fade_ = f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f); };
 
     void optimize();
 
@@ -169,6 +176,7 @@ namespace ego_planner
     /* formation (ported from ZJU-FAST-Lab/Swarm-Formation) */
     SwarmGraph::Ptr swarm_graph_;
     double lambda_formation_{0.0}; // formation similarity weight
+    double formation_fade_{1.0};   // near-goal fade factor, see setFormationFade()
     int formation_type_{0};
     int formation_size_{0};
     bool use_formation_{false};

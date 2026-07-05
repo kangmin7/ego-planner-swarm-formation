@@ -29,7 +29,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from px4_msgs.msg import (
-    OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition, VehicleStatus,
+    OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition,
+    VehicleOdometry, VehicleStatus,
 )
 from quadrotor_msgs.msg import PositionCommand
 
@@ -45,7 +46,10 @@ TICK_HZ = 20.0            # higher rate keeps the per-tick position-setpoint ste
 # pillar-base region. Handing off at cruise altitude exactly (1.5, with the
 # virtual floor at 1.0) left no margin and lost a drone to a ground-level
 # pillar strike right after departure.
-TAKEOFF_ALT_M = 2.5       # climb-in-place target altitude before handing off to the planner
+TAKEOFF_ALT_M = 3.0       # climb-in-place target altitude before handing off to the planner
+                          # (estimated; gz ground truth showed the baro-referenced height
+                          # reads ~0.65 m HIGH in flight, so the whole flight band is
+                          # shifted up to keep true altitude safely off the ground)
 TAKEOFF_TOLERANCE_M = 0.3
 
 # Don't arm until the EKF height estimate has been quiet on the ground for
@@ -120,8 +124,13 @@ class OffboardBridge(Node):
         self._pub_tsp = self.create_publisher(TrajectorySetpoint, f'{px4_ns}/fmu/in/trajectory_setpoint', px4_qos)
         self._pub_cmd = self.create_publisher(VehicleCommand, f'{px4_ns}/fmu/in/vehicle_command', px4_qos)
 
+        # vehicle_odometry, NOT vehicle_local_position: the latter silently
+        # fails to stream on a large fraction of multi-instance boots, leaving
+        # every consumer here (settle gate, takeoff check, carrot limiter)
+        # running on a zero-frozen message (runs 80/81 runaways). Odometry is
+        # the same EKF solution and streams reliably on every boot.
         self.create_subscription(
-            VehicleLocalPosition, f'{px4_ns}/fmu/out/vehicle_local_position_v1', self._cb_local_pos, px4_qos)
+            VehicleOdometry, f'{px4_ns}/fmu/out/vehicle_odometry', self._cb_odom, px4_qos)
         self.create_subscription(
             VehicleStatus, f'{px4_ns}/fmu/out/vehicle_status_v1', self._cb_status, px4_qos)
         self.create_subscription(PositionCommand, '/position_cmd', self._cb_position_cmd, 10)
@@ -144,8 +153,12 @@ class OffboardBridge(Node):
         self.create_timer(1.0 / TICK_HZ, self._tick)
         self.get_logger().info('px4_offboard_bridge ready — waiting for /position_cmd')
 
-    def _cb_local_pos(self, msg: VehicleLocalPosition):
-        self._local_pos = msg
+    def _cb_odom(self, msg: VehicleOdometry):
+        lp = self._local_pos
+        lp.x, lp.y, lp.z = float(msg.position[0]), float(msg.position[1]), float(msg.position[2])
+        lp.vz = float(msg.velocity[2])
+        qw, qx, qy, qz = (float(v) for v in msg.q)
+        lp.heading = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
 
     def _cb_status(self, msg: VehicleStatus):
         self._status = msg
@@ -247,7 +260,12 @@ class OffboardBridge(Node):
         # commanding an aggressive, unnecessary yaw correction during the climb.
         self._send_setpoint(x, y, target_z, None)
 
-        if abs(self._local_pos.z - target_z) < TAKEOFF_TOLERANCE_M:
+        # One-sided check: hand off once the climb has reached altitude.
+        # The symmetric |z - target| < tol version deadlocked when the
+        # GPS-referenced height settled ~0.3 m ABOVE the setpoint (run 40:
+        # two drones hovered at 2.79-2.80 m forever, never triggering their
+        # planners, while the third flew the mission alone).
+        if -self._local_pos.z >= TAKEOFF_ALT_M - TAKEOFF_TOLERANCE_M:
             if not self._have_position_cmd:
                 return
             self.get_logger().info('takeoff complete -> tracking ego_planner')
@@ -263,6 +281,21 @@ class OffboardBridge(Node):
         # roll/pitch oscillation on this airframe (observed via telemetry), most likely
         # the position controller and the velocity feedforward fighting each other.
         x, y, z = self._setpoint_ned
+        # Carrot limiter: never command a point further than 2.5 m from where
+        # the vehicle actually is. Planner-side bugs (a trajectory whose clock
+        # raced ahead of a physically held-up drone) have produced 9 m setpoint
+        # jumps that sent the vehicle on over-speed dashes into the ground;
+        # this is the last line of defense against any such discontinuity.
+        # Horizontal-only: scaling z toward the vehicle neuters the altitude
+        # hold exactly while it chases a distant carrot, and it sinks out of
+        # the sky (run 66). The commanded altitude always applies in full.
+        dx = x - self._local_pos.x
+        dy = y - self._local_pos.y
+        d = math.sqrt(dx * dx + dy * dy)
+        if d > 2.5:
+            s = 2.5 / d
+            x = self._local_pos.x + dx * s
+            y = self._local_pos.y + dy * s
         self._send_setpoint(x, y, z, self._yaw_ned)
 
 

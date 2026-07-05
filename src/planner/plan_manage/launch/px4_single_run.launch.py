@@ -81,6 +81,14 @@ def generate_launch_description():
     formation_num_cmd = DeclareLaunchArgument(
         'formation_num', default_value=formation_num,
         description='Formation member count for the takeoff barrier (0 disables)')
+    formation_stretch_max = LaunchConfiguration('formation_stretch_max', default=-1.0)
+    formation_nominal_leads = LaunchConfiguration('formation_nominal_leads', default='')
+    formation_nominal_leads_cmd = DeclareLaunchArgument(
+        'formation_nominal_leads', default_value=formation_nominal_leads,
+        description='Comma-separated nominal along-path lead per member (m)')
+    formation_stretch_max_cmd = DeclareLaunchArgument(
+        'formation_stretch_max', default_value=formation_stretch_max,
+        description='Max lead (m) over the laggiest member before the local-target horizon throttles (<=0 disables)')
 
     max_vel = LaunchConfiguration('max_vel', default=1.0)
     max_acc = LaunchConfiguration('max_acc', default=2.0)
@@ -140,7 +148,11 @@ def generate_launch_description():
             'max_vel': max_vel,
             'max_acc': max_acc,
             'planning_horizon': str(5.0),
-            'use_distinctive_trajs': 'True',
+            # Multi-topology search multiplies optimizer attempts in dense
+            # clutter and precedes every -1008 line-search failure storm
+            # (drones wedge mid-field cycling GEN_NEW_TRAJ, run 71). Single
+            # topology is slightly less optimal but far more robust here.
+            'use_distinctive_trajs': 'False',
             'flight_type': str(2),
             'point_num': str(1),
             'point0_x': target_x,
@@ -151,6 +163,8 @@ def generate_launch_description():
             'formation_type': formation_type,
             'lambda_formation': lambda_formation,
             'formation_num': formation_num,
+            'formation_stretch_max': formation_stretch_max,
+            'formation_nominal_leads': formation_nominal_leads,
             'virtual_ceil_height': virtual_ceil_height,
             'virtual_floor_height': virtual_floor_height,
             'min_takeoff_height': min_takeoff_height,
@@ -239,6 +253,49 @@ def generate_launch_description():
 
     lidar_bridge_action = OpaqueFunction(function=_make_lidar_bridge_node)
 
+    def _make_truth_bridge_nodes(context, *args, **kwargs):
+        # Ground-truth odometry path (mocap stand-in): gz OdometryPublisher ->
+        # parameter_bridge -> truth_odom_bridge -> PX4 external vision. The
+        # simulated baro/GPS chain destabilizes the EKF on the dev host; the
+        # EKF fuses this stream instead (EKF2_EV_CTRL/HGT_REF in the airframe).
+        did = drone_id.perform(context)
+        gz_topic = f'/model/x500_lidar360_{did}/odometry'
+        config_dir = os.path.expanduser('~/.ros/px4_bridge_lidar_configs')
+        os.makedirs(config_dir, exist_ok=True)
+        config_path = os.path.join(config_dir, f'truth_bridge_{did}.yaml')
+        with open(config_path, 'w') as f:
+            f.write(
+                f'- ros_topic_name: "{gz_topic}"\n'
+                f'  gz_topic_name: "{gz_topic}"\n'
+                '  ros_type_name: "nav_msgs/msg/Odometry"\n'
+                '  gz_type_name: "gz.msgs.Odometry"\n'
+                '  direction: GZ_TO_ROS\n'
+            )
+        return [
+            Node(
+                package='ros_gz_bridge',
+                executable='parameter_bridge',
+                name=['drone_', did, '_truth_gz_bridge'],
+                output='screen',
+                parameters=[{'config_file': config_path}],
+                additional_env={'GZ_VERSION': 'harmonic'},
+            ),
+            Node(
+                package='px4_bridge',
+                executable='truth_odom_bridge',
+                name=['drone_', did, '_truth_odom_bridge'],
+                output='screen',
+                parameters=[
+                    {'px4_ns': px4_ns},
+                    {'spawn_x': spawn_x},
+                    {'spawn_y': spawn_y},
+                ],
+                remappings=[('truth_odom', gz_topic)],
+            ),
+        ]
+
+    truth_bridge_action = OpaqueFunction(function=_make_truth_bridge_nodes)
+
     ld = LaunchDescription()
     ld.add_action(drone_id_cmd)
     ld.add_action(map_size_x_cmd)
@@ -257,6 +314,8 @@ def generate_launch_description():
     ld.add_action(formation_type_cmd)
     ld.add_action(lambda_formation_cmd)
     ld.add_action(formation_num_cmd)
+    ld.add_action(formation_stretch_max_cmd)
+    ld.add_action(formation_nominal_leads_cmd)
     ld.add_action(max_vel_cmd)
     ld.add_action(max_acc_cmd)
     ld.add_action(virtual_ceil_height_cmd)
@@ -268,5 +327,11 @@ def generate_launch_description():
     ld.add_action(odom_cloud_bridge_node)
     ld.add_action(offboard_bridge_node)
     ld.add_action(lidar_bridge_action)
+    # truth_bridge_action intentionally NOT added: PX4's gz_bridge natively
+    # consumes the model's odometry_with_covariance and publishes it as
+    # world-frame vehicle_visual_odometry (GZBridge.cpp:244). Running our own
+    # ROS-side EV forwarder alongside it double-feeds the EKF with two
+    # disagreeing frames and arming is denied ("horizontal position
+    # unstable", runs 58-61).
 
     return ld

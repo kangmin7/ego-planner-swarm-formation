@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'odom_cloud_bridge = px4_bridge.odom_cloud_bridge:main',
             'offboard_bridge = px4_bridge.offboard_bridge:main',
+            'truth_odom_bridge = px4_bridge.truth_odom_bridge:main',
         ],
     },
 )
