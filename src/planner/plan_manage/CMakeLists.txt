@@ -85,6 +85,12 @@ install(
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# PX4 depth-camera adapter (copied from the mighty package)
+install(
+  PROGRAMS scripts/ego_depth_adapter.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 # 安装 launch 文件
 install(
   DIRECTORY launch/
